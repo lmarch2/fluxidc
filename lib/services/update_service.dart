@@ -85,9 +85,9 @@ class UpdateInfo {
 /// 应用更新检查服务
 class UpdateService {
   static const bool enabled = AppConstants.enableAppUpdates;
-  static const String _repository = 'Lingyan000/fluxdo';
-  static const String _apiUrl =
-      'https://api.github.com/repos/$_repository/releases/latest';
+  static const String repository = 'lmarch2/fluxidc';
+  static const String apiUrl =
+      'https://api.github.com/repos/$repository/releases/latest';
   static const String _autoCheckUpdateKey = 'auto_check_update';
   static const String _cacheKey = 'update_cache';
   static const String _cacheTimeKey = 'update_cache_time';
@@ -98,14 +98,20 @@ class UpdateService {
 
   final Dio _dio;
   final SharedPreferences? _prefs;
+  final Future<String> Function()? _currentVersionLoader;
 
-  UpdateService({Dio? dio, SharedPreferences? prefs})
+  UpdateService({
+    Dio? dio,
+    SharedPreferences? prefs,
+    Future<String> Function()? currentVersionLoader,
+  })
       : _dio = dio ?? Dio(),
-        _prefs = prefs;
+        _prefs = prefs,
+        _currentVersionLoader = currentVersionLoader;
 
   /// 获取自动检查更新设置
   bool getAutoCheckUpdate() {
-    return enabled && (_prefs?.getBool(_autoCheckUpdateKey) ?? false);
+    return enabled && (_prefs?.getBool(_autoCheckUpdateKey) ?? true);
   }
 
   /// 设置自动检查更新
@@ -115,6 +121,9 @@ class UpdateService {
 
   /// 获取当前应用版本号
   Future<String> getCurrentVersion() async {
+    if (_currentVersionLoader != null) {
+      return _currentVersionLoader();
+    }
     final packageInfo = await PackageInfo.fromPlatform();
     return packageInfo.version;
   }
@@ -197,7 +206,7 @@ class UpdateService {
 
     try {
       final response = await _dio.get(
-        _apiUrl,
+        apiUrl,
         options: Options(
           responseType: ResponseType.json,
           headers: {
@@ -272,7 +281,8 @@ class UpdateService {
           UpdateInfo.fromJson(jsonDecode(cacheJson) as Map<String, dynamic>);
 
       // 重新计算 hasUpdate（因为当前版本可能已变化）
-      final hasUpdate = _compareVersions(cached.remoteVersion, currentVersion) > 0;
+      final hasUpdate =
+          compareVersions(cached.remoteVersion, currentVersion) > 0;
 
       return UpdateInfo(
         currentVersion: currentVersion,
@@ -297,7 +307,7 @@ class UpdateService {
 
   /// 解析更新信息
   UpdateInfo _parseUpdateInfo(Map<String, dynamic> data, String currentVersion) {
-    final remoteVersion = (data['tag_name'] as String).replaceAll('v', '');
+    final remoteVersion = parseReleaseVersion(data['tag_name'] as String);
     final releaseUrl = data['html_url'] as String;
     var releaseNotes = data['body'] as String? ?? '';
 
@@ -309,7 +319,7 @@ class UpdateService {
       releaseNotes = releaseNotes.substring(0, markerIndex).trim();
     }
 
-    final hasUpdate = _compareVersions(remoteVersion, currentVersion) > 0;
+    final hasUpdate = compareVersions(remoteVersion, currentVersion) > 0;
 
     // 解析 APK 资源
     final assets = data['assets'] as List<dynamic>? ?? [];
@@ -386,15 +396,29 @@ class UpdateService {
     return null;
   }
 
-  /// 比较两个版本号
+  /// 提取版本标签开头的语义版本号。
+  ///
+  /// 支持 `v0.2.26`、`0.2.26+1` 与 `v0.2.26-fluxidc.1`。
+  static String parseReleaseVersion(String version) {
+    final match = RegExp(
+      r'^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$',
+      caseSensitive: false,
+    ).firstMatch(version.trim());
+    if (match == null) {
+      throw FormatException('无法解析版本号: $version');
+    }
+    return '${match.group(1)}.${match.group(2)}.${match.group(3)}';
+  }
+
+  /// 比较两个版本号的主版本、次版本和补丁版本。
   ///
   /// 返回值:
   /// - 正数: v1 > v2
   /// - 0: v1 == v2
   /// - 负数: v1 < v2
-  int _compareVersions(String v1, String v2) {
-    final parts1 = v1.split('.').map(int.parse).toList();
-    final parts2 = v2.split('.').map(int.parse).toList();
+  static int compareVersions(String v1, String v2) {
+    final parts1 = parseReleaseVersion(v1).split('.').map(int.parse).toList();
+    final parts2 = parseReleaseVersion(v2).split('.').map(int.parse).toList();
 
     for (int i = 0; i < 3; i++) {
       final p1 = i < parts1.length ? parts1[i] : 0;

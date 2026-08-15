@@ -23,8 +23,8 @@ class AppConstants {
   /// IDC Flare 不提供 Linux.DO Credit、CDK 与 Connect 服务。
   static const bool enableLinuxDoServices = false;
 
-  /// 分支未配置独立发布仓库前，禁止安装 FluxDO 上游发布包。
-  static const bool enableAppUpdates = false;
+  /// 从 FluxIDC 自有 GitHub Releases 检查并安装更新。
+  static const bool enableAppUpdates = true;
 
   /// 当前仓库未配置独立的崩溃上报项目，避免误发到上游服务。
   static const bool enableCrashReporting = false;
