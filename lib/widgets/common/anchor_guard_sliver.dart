@@ -119,29 +119,69 @@ class RenderAnchorGuardSliver extends RenderSliver {
   set structureSignature(int value) {
     if (_structureSignature == value) return;
     _structureSignature = value;
-    // 结构变了:旧锚的 RenderBox 可能被 index 复用换了内容,基线作废。
-    // updateRenderObject 在 build 期执行,先于本帧布局,时序正确。
-    _invalidateBaseline();
+    // 结构变了:多盒列表(SliverList)的 child 按 index 复用,同一 RenderBox
+    // 可能已换内容,基线作废。updateRenderObject 在 build 期执行,先于本帧
+    // 布局,时序正确。
+    //
+    // **单盒 sliver 锚豁免**:签名描述的是帖子列表的 index↔内容映射,与
+    // 推荐区/header 等 SliverToBoxAdapter 无关 —— 它们的 RenderBox 跨
+    // rebuild 身份稳定(Element 按 slot+type 复用,等价浏览器锚定依赖的
+    // DOM 节点身份)。作废它会让"视口停在推荐区时新帖落地"这类最需要
+    // 修正的帧(落地必然改签名)恰好失去保护。
+    final anchor = _anchorBox;
+    if (anchor == null ||
+        !anchor.attached ||
+        anchor.parentData is SliverMultiBoxAdaptorParentData) {
+      _invalidateBaseline();
+    }
   }
 
   // —— 基线:上一趟布局结束时的锚元素与环境快照 ——
-  // 锚元素 = 同半场里含视口上沿的帖子(退而求其次:上沿下方最近的
-  // 帖子)。持有 RenderBox 引用:数据更新只换 Post 内容,Element/
-  // RenderObject 按 index 复用不变;被回收(detach/keptAlive)则基线
-  // 自动作废。
+  // 锚元素 = 同半场里含视口上沿的 box(退而求其次:上沿下方最近者),
+  // 候选含帖子列表项与单盒 sliver 的 child(推荐区/header 等,见
+  // _captureBaseline)。持有 RenderBox 引用:数据更新只换内容,Element/
+  // RenderObject 复用不变;被回收(detach/keptAlive)则基线自动作废。
   RenderBox? _anchorBox;
   double _anchorTop = 0.0;
   double _basePixels = 0.0;
   double _baseViewportAnchor = 0.0;
   Size _baseViewportSize = Size.zero;
 
-  /// 连续修正保险丝:修正后 pixels 必然偏离基线、下一趟只能重建基线,
-  /// 理论上不存在连环修正;万一有布局怪癖打破该假设,到 3 次直接放弃,
-  /// 宁可跳一下也不逼近 viewport 的布局循环上限。
+  /// 连续修正保险丝:限制**同一帧内**的连环修正。修正后基线随 correctBy
+  /// 同步平移(见 _measure),同帧重试趟量到的 delta≈0 走重建分支,理论
+  /// 上不存在同帧连环;万一有布局怪癖打破该假设,到 3 次直接放弃,宁可
+  /// 跳一下也不逼近 viewport 的布局循环上限。跨帧(折叠动画逐帧长高、
+  /// 逐帧武装逐帧修)是正常工况,按帧时间戳重置。
   int _correctionStreak = 0;
+  Duration _streakFrame = Duration.zero;
 
   /// 位移小于该值不修正:吸收文本重排的亚像素噪音,避免无意义的重排趟数
   static const _minCorrection = 0.5;
+
+  // —— 修正的一次性消费保障 ——
+  // viewport 收到 scrollOffsetCorrection 后 correctBy 并整趟重试,但哨兵
+  // 零尺寸且居半场远端,重试趟约束往往逐位不变 —— [layout] 的缓存短路
+  // 跳过 performLayout,geometry 里残留的 correction 会被 viewport
+  // **重复消费**(实测同一笔 Δ 连环 correctBy 十余次直到布局循环上限,
+  // 修正量放大 N 倍变成反向跳动)。框架内建 sliver 不踩此坑:它们发修正
+  // 后自身 scrollOffset 必变、缓存必失效;哨兵是"替兄弟发修正、自己
+  // 约束不动"的特例。布局期又禁止 markNeedsLayout(变异断言),故改在
+  // **读取端**剥离:发修正时记下 pixels,correctBy 一旦落地(pixels 偏离
+  // 记录值),geometry 读到的就是剥掉修正的零几何 —— 恰好消费一次。
+  ScrollPosition? _correctionOffset;
+  double _correctionEmitPixels = 0;
+
+  @override
+  SliverGeometry? get geometry {
+    final g = super.geometry;
+    final off = _correctionOffset;
+    if (g?.scrollOffsetCorrection != null &&
+        off != null &&
+        (!off.hasPixels || off.pixels != _correctionEmitPixels)) {
+      return SliverGeometry.zero;
+    }
+    return g;
+  }
 
   void _invalidateBaseline() {
     _anchorBox = null;
@@ -149,6 +189,14 @@ class RenderAnchorGuardSliver extends RenderSliver {
 
   @override
   void performLayout() {
+    if (debugTraceCorrections) {
+      // ignore: avoid_print
+      print('[PROBE ${constraints.growthDirection.name}] performLayout '
+          'ENTER scrollOffset=${constraints.scrollOffset} '
+          'overlap=${constraints.overlap} '
+          'remainingPaintExtent=${constraints.remainingPaintExtent} '
+          'precedingScrollExtent=${constraints.precedingScrollExtent}');
+    }
     geometry = SliverGeometry.zero;
     if (!_enabled || constraints.axis != Axis.vertical) {
       _invalidateBaseline();
@@ -180,6 +228,10 @@ class RenderAnchorGuardSliver extends RenderSliver {
           ? -1.0
           : 1.0;
       geometry = SliverGeometry(scrollOffsetCorrection: sign * correction!);
+      // 一次性消费票据:correctBy 落地(pixels 离开此值)后 geometry
+      // 读取端自动剥离修正,防重复消费(见 geometry getter)
+      _correctionOffset = offset;
+      _correctionEmitPixels = offset.pixels;
     }
   }
 
@@ -204,33 +256,88 @@ class RenderAnchorGuardSliver extends RenderSliver {
         viewport.anchor == _baseViewportAnchor &&
         viewport.size == _baseViewportSize;
 
+    if (debugTraceCorrections) {
+      // ignore: avoid_print
+      print('[PROBE ${constraints.growthDirection.name}] _measure enter '
+          'canCompare=$canCompare streak=$_correctionStreak '
+          'pixels=${offset.pixels} basePixels=$_basePixels '
+          'anchorHash=${anchor?.hashCode.toRadixString(16)}');
+    }
+    // 保险丝按帧重置:跨帧连续修正是正常工况(折叠动画逐帧长高、逐帧
+    // 武装),只防同一帧内的连环修正
+    final frameNow = SchedulerBinding.instance.currentFrameTimeStamp;
+    if (frameNow != _streakFrame) {
+      _streakFrame = frameNow;
+      _correctionStreak = 0;
+    }
     if (canCompare && _correctionStreak < 3) {
       final top = _boxTopInViewport(anchor, viewport);
       final delta = top - _anchorTop;
+      if (debugTraceCorrections) {
+        // ignore: avoid_print
+        print('[PROBE ${constraints.growthDirection.name}] top=$top '
+            'anchorTop=$_anchorTop delta=$delta');
+      }
       if (delta.abs() > _minCorrection) {
         // 锚往下移 Δ(上方内容变高)→ pixels 需同增 Δ 把它拉回原位;
         // 变矮同理(Δ 为负)
         _correctionStreak++;
+        // 基线随修正平移:correctBy 后 pixels = 旧值 + Δ、锚回到
+        // _anchorTop —— 直接把基线推进到修正后的预期态,下一武装帧
+        // (逐帧动画)可继续比较,不用等一趟"pixels 不匹配 → 重建"
+        // 白白吞掉那一帧的位移
+        _basePixels += delta;
         _pendingLogDelta += delta;
         _scheduleLog();
+        assert(() {
+          if (debugTraceCorrections) {
+            debugPrint(
+              '[GUARD ${constraints.growthDirection.name}] correct '
+              'Δ=${delta.toStringAsFixed(2)} anchor=${anchor.runtimeType}'
+              '@${anchor.hashCode.toRadixString(16)} '
+              'top=${top.toStringAsFixed(2)} '
+              'baseTop=${_anchorTop.toStringAsFixed(2)} '
+              'pixels=${offset.pixels.toStringAsFixed(2)}',
+            );
+          }
+          return true;
+        }());
         return delta;
       }
     }
 
+    assert(() {
+      if (debugTraceCorrections && _armed) {
+        debugPrint(
+          '[GUARD ${constraints.growthDirection.name}] rebaseline '
+          'canCompare=$canCompare armed=$_armed '
+          'anchorValid=${anchor != null && _anchorStillValid(anchor, viewport)} '
+          'pixelsMatch=${offset.pixels == _basePixels} '
+          'pixels=${offset.pixels.toStringAsFixed(2)} '
+          'basePixels=${_basePixels.toStringAsFixed(2)}',
+        );
+      }
+      return true;
+    }());
     _correctionStreak = 0;
     _captureBaseline(viewport, offset);
     return null;
   }
 
+  /// 临时诊断开关(仅 debug/test):打印每笔修正与基线重建原因
+  static bool debugTraceCorrections = false;
+
   /// 锚元素仍可参与比较:还挂在树上、有尺寸、没被挪进 keepAlive 桶
   /// (桶里的 child 仍 attached 但 layoutOffset 是陈旧值),且确实在本
   /// viewport 之下(getTransformTo 对非祖先会 assert)。
+  ///
+  /// 单盒 sliver 的 child(推荐区/header 等)没有 multi-box parentData,
+  /// 只做通用校验 —— 它不参与回收,不存在 keepAlive/陈旧 offset 问题。
   bool _anchorStillValid(RenderBox anchor, RenderViewport viewport) {
     if (!anchor.attached || !anchor.hasSize) return false;
     final parentData = anchor.parentData;
-    if (parentData is! SliverMultiBoxAdaptorParentData ||
-        parentData.keptAlive ||
-        parentData.layoutOffset == null) {
+    if (parentData is SliverMultiBoxAdaptorParentData &&
+        (parentData.keptAlive || parentData.layoutOffset == null)) {
       return false;
     }
     RenderObject? node = anchor.parent;
@@ -249,9 +356,16 @@ class RenderAnchorGuardSliver extends RenderSliver {
     ).dy;
   }
 
-  /// 重建基线:只遍历**与自己同增长方向**的兄弟 sliver 里的帖子列表
-  /// (RenderSliverMultiBoxAdaptor;header/typing/分页指示器都是单 box
-  /// 适配器,自动排除),选含视口上沿的 child 为锚。
+  /// 重建基线:只遍历**与自己同增长方向**的兄弟 sliver,选含视口上沿的
+  /// box 为锚。候选包括:
+  /// - 帖子列表项(RenderSliverMultiBoxAdaptor 的 child)
+  /// - 单盒 sliver 的 child(RenderSliverSingleBoxAdapter:推荐区/header/
+  ///   typing 等)。不纳入的话,视口停在帖子流末尾的推荐区时**选不出任何
+  ///   锚**(帖子全在上沿之上,单盒又不参选),新帖落地把推荐区往下推,
+  ///   哨兵全程失明 —— 这正是浏览器锚定"任意 DOM 节点可为锚"覆盖、
+  ///   而旧实现漏掉的场景。spinner 类瞬态盒被选为锚后消失只会作废基线
+  ///   (身份不复存在),不会产生错误修正,故无需 overflow-anchor:none
+  ///   式的显式排除。
   ///
   /// 限定同半场的原因:viewport 每趟先布局 reverse 区再布局 forward 区,
   /// reverse 哨兵布局时 forward 兄弟可能尚未重排,跨半场读到的是陈旧
@@ -263,6 +377,21 @@ class RenderAnchorGuardSliver extends RenderSliver {
     RenderBox? below;
     double belowTop = double.infinity;
 
+    void consider(RenderBox child) {
+      final top = _boxTopInViewport(child, viewport);
+      final bottom = top + child.size.height;
+      if (top <= 0 && bottom > 0) {
+        // 多个候选(理论上仅重叠边界)取顶边最贴近上沿的
+        if (containing == null || top > containingTop) {
+          containing = child;
+          containingTop = top;
+        }
+      } else if (top > 0 && top < belowTop) {
+        below = child;
+        belowTop = top;
+      }
+    }
+
     void visit(RenderObject node) {
       if (node is RenderSliverMultiBoxAdaptor) {
         RenderBox? child = node.firstChild;
@@ -271,21 +400,13 @@ class RenderAnchorGuardSliver extends RenderSliver {
           if (parentData is SliverMultiBoxAdaptorParentData &&
               parentData.layoutOffset != null &&
               child.hasSize) {
-            final top = _boxTopInViewport(child, viewport);
-            final bottom = top + child.size.height;
-            if (top <= 0 && bottom > 0) {
-              // 多个候选(理论上仅重叠边界)取顶边最贴近上沿的
-              if (containing == null || top > containingTop) {
-                containing = child;
-                containingTop = top;
-              }
-            } else if (top > 0 && top < belowTop) {
-              below = child;
-              belowTop = top;
-            }
+            consider(child);
           }
           child = node.childAfter(child);
         }
+      } else if (node is RenderSliverSingleBoxAdapter) {
+        final child = node.child;
+        if (child != null && child.hasSize) consider(child);
       } else if (node is RenderSliver) {
         node.visitChildren(visit);
       }
@@ -326,6 +447,7 @@ class RenderAnchorGuardSliver extends RenderSliver {
   @override
   void detach() {
     _invalidateBaseline();
+    _correctionOffset = null;
     super.detach();
   }
 

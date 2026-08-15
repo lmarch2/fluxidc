@@ -1,5 +1,6 @@
 import 'dart:async' show unawaited;
 
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:app_icons/app_icons.dart';
 import 'package:common_ui/common_ui.dart';
@@ -8,6 +9,7 @@ import 'package:jovial_svg/jovial_svg.dart';
 import 'package:gal/gal.dart';
 import 'package:super_clipboard/super_clipboard.dart';
 import '../services/discourse_cache_manager.dart';
+import '../services/dynamic_content_suspension_service.dart';
 import '../services/image_decode_spec_memo.dart';
 import '../utils/double_tap_zoom_controller.dart';
 import '../utils/hero_visibility_controller.dart';
@@ -23,7 +25,9 @@ import '../services/toast_service.dart';
 import '../utils/platform_utils.dart';
 import '../utils/share_utils.dart';
 import '../widgets/common/app_bottom_sheet.dart';
+import '../widgets/common/hero_image.dart';
 import '../widgets/common/image_context_menu.dart';
+import '../widgets/common/predictive_back_cupertino_transitions.dart';
 import 'package:m3e_ui/m3e_ui.dart';
 import '../l10n/s.dart';
 
@@ -55,6 +59,9 @@ class ImageViewerPage extends ConsumerStatefulWidget {
   /// 源缩略图的圆角(飞行中插值到 0 / 从 0 恢复)
   final double heroSourceRadius;
 
+  /// 源为圆形裁切(头像):飞行中圆形↔直角连续插值
+  final bool heroSourceCircular;
+
   const ImageViewerPage({
     super.key,
     this.imageUrl,
@@ -69,6 +76,7 @@ class ImageViewerPage extends ConsumerStatefulWidget {
     this.filenames,
     this.heroSourceFit,
     this.heroSourceRadius = 0,
+    this.heroSourceCircular = false,
   }) : assert(imageUrl != null || imageBytes != null);
 
   /// 查看器路由的黑底/整页淡入淡出曲线:与 Hero 飞行(吃路由原始
@@ -82,6 +90,10 @@ class ImageViewerPage extends ConsumerStatefulWidget {
       curve: const Interval(0.0, 0.6, curve: Curves.easeOut),
       reverseCurve: const Interval(0.4, 1.0, curve: Curves.easeIn),
     );
+  }
+
+  static bool _hasHeroTransition(String? heroTag, List<String>? heroTags) {
+    return heroTag != null || (heroTags?.isNotEmpty ?? false);
   }
 
   /// 使用透明路由打开图片查看器。返回的 Future 在查看器关闭时完成
@@ -99,7 +111,19 @@ class ImageViewerPage extends ConsumerStatefulWidget {
     List<String?>? filenames,
     BoxFit? heroSourceFit,
     double heroSourceRadius = 0,
+    bool heroSourceCircular = false,
   }) {
+    // Hero 飞行是框架级硬条件:只发生在同一 Navigator 的两个 PageRoute
+    // 之间(HeroController._maybeStartHeroTransition 对非 PageRoute 直接
+    // 返回)。从弹窗(PopupRoute,如通知页面弹窗/用户卡片)里打开时
+    // from 端不是 PageRoute,飞行永远不启动——但查看器拿着 heroTag 会
+    // 走"配对 Hero"的开合/退场路径(禁用缩放预览、退场等归位飞行),
+    // 表现为闪烁/贴片静止。此时一律退化为纯淡入淡出(缩略图占位仍然
+    // 生效,只是不飞)。
+    if (ModalRoute.of(context) is! PageRoute) {
+      heroTag = null;
+      heroTags = null;
+    }
     return Navigator.push(
       context,
       PageRouteBuilder(
@@ -118,14 +142,25 @@ class ImageViewerPage extends ConsumerStatefulWidget {
             filenames: filenames,
             heroSourceFit: heroSourceFit,
             heroSourceRadius: heroSourceRadius,
+            heroSourceCircular: heroSourceCircular,
           );
         },
-        transitionsBuilder: (context, animation, secondaryAnimation, child) {
-          return FadeTransition(
-            opacity: _routeFadeAnimation(animation),
-            child: child,
-          );
-        },
+        transitionsBuilder: (context, animation, secondaryAnimation, child) =>
+            buildPredictiveBackPageTransitions(
+              context,
+              animation,
+              secondaryAnimation,
+              child,
+              // 有配对 Hero 时不用缩放预览(会跟 Hero 飞行体打架),但
+              // 仍认领手势:HeroController 只为 user gesture 转场启动
+              // 飞行,认领 + 两端 transitionOnUserGestures 才有跟手
+              // Hero 返回;fade 由手势进度驱动。
+              useSharedElementPreview: !_hasHeroTransition(heroTag, heroTags),
+              fallbackBuilder: (_, animation, _, child) => FadeTransition(
+                opacity: _routeFadeAnimation(animation),
+                child: child,
+              ),
+            ),
       ),
     );
   }
@@ -140,12 +175,17 @@ class ImageViewerPage extends ConsumerStatefulWidget {
         pageBuilder: (context, animation, secondaryAnimation) {
           return ImageViewerPage(imageBytes: bytes);
         },
-        transitionsBuilder: (context, animation, secondaryAnimation, child) {
-          return FadeTransition(
-            opacity: _routeFadeAnimation(animation),
-            child: child,
-          );
-        },
+        transitionsBuilder: (context, animation, secondaryAnimation, child) =>
+            buildPredictiveBackPageTransitions(
+              context,
+              animation,
+              secondaryAnimation,
+              child,
+              fallbackBuilder: (_, animation, _, child) => FadeTransition(
+                opacity: _routeFadeAnimation(animation),
+                child: child,
+              ),
+            ),
       ),
     );
   }
@@ -160,6 +200,7 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
   bool _isSaving = false;
   bool _isSharing = false;
   bool _showUI = true;
+  late final DynamicContentSuspensionLease _dynamicContentLease;
 
   /// 通知所有缓存页面当前活跃的 Hero 页码变化，确保只有当前页有 Hero
   late final ValueNotifier<int> _activeHeroPage;
@@ -179,6 +220,15 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
   /// 持有 —— loading→completed 等树切换只换绘制载体,手势状态与进行
   /// 中的交互(如下滑关闭)不再随载体销毁。
   final Map<int, ImageGestureController> _gestureControllers = {};
+
+  /// 退场缩放归位的两路钩子(路由动画反转 = 按钮/程序化 pop;
+  /// userGestureInProgress = 预测返回/iOS 拖拽)。缩放是
+  /// RawGestureImage 的画布级变换,Hero 飞行只收缩布局盒子,飞行中
+  /// 逐帧拿「全屏布局的缩放裁切」往小盒子里画,内容乱跳;落地换回
+  /// 源端正常图又突变一次 —— 放大后返回的闪烁即此。pop 启动瞬间
+  /// (飞行测量前)把缩放归位,飞行全程 contain,与源端无缝。
+  ModalRoute<dynamic>? _route;
+  ValueListenable<bool>? _navUserGesture;
 
   ImageGestureController _obtainGestureController(
     int index, {
@@ -217,55 +267,35 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
   /// 构建查看器侧 Hero(单图/画廊共用)。
   ///
   /// 源缩略图为 cover 裁剪展示(heroSourceFit == cover,目前只有网格
-  /// 瓦片)时,飞行体升级为双层 crossfade:cover 纹理层(带圆角插值)
-  /// 在飞行前段淡出、查看器 contain 层淡入 —— 消除起飞瞬间
-  /// 「裁剪图→完整图」的跳变(落地/pop 方向反向同理)。
+  /// 瓦片)时,飞行体为 [CoverContainFlightImage] 单层裁切插值(裁切
+  /// 窗口与飞行缩放绑同一 progress,两端与真实内容像素级对齐)。
   ///
-  /// 注意 pop 方向对网格也走本 shuttle(源端是朴素 Hero 无自定义
-  /// shuttle,Flutter 回落到 fromHero=查看器侧)。
+  /// push 方向本 shuttle 生效(toHero=查看器优先);pop 方向源端
+  /// HeroImage 的 shuttle 生效(带同款裁切插值),双向一致。
   Widget _buildViewerHero({
     required String tag,
     required String? thumbUrl,
     required Widget child,
   }) {
     final bool coverSource =
-        widget.heroSourceFit == BoxFit.cover && thumbUrl != null;
+        (widget.heroSourceFit == BoxFit.cover || widget.heroSourceCircular) &&
+        thumbUrl != null;
     return Hero(
       tag: tag,
+      // 预测返回是 user gesture 转场,不开这个标记 Hero 不飞
+      // (与所有源端 Hero 配对开启,见 hero_image/discourse_image 等)
+      transitionOnUserGestures: true,
       flightShuttleBuilder: !coverSource
           ? (_, _, _, _, _) => child
           : (flightContext, animation, direction, fromContext, toContext) {
-              // push:cover 层在前 40% 淡出;pop:cover 层在后 40% 淡入
-              // (animation 在 pop 方向由 1 走向 0,同一 Interval 语义对称)
-              final Animation<double> coverOpacity = animation.drive(
-                Tween<double>(begin: 1.0, end: 0.0).chain(
-                  CurveTween(
-                    curve: const Interval(0.0, 0.4, curve: Curves.easeOut),
-                  ),
-                ),
-              );
-              final double radius = widget.heroSourceRadius;
-              return Stack(
-                fit: StackFit.expand,
-                children: [
-                  child,
-                  FadeTransition(
-                    opacity: coverOpacity,
-                    child: AnimatedBuilder(
-                      animation: animation,
-                      builder: (context, coverChild) => ClipRRect(
-                        borderRadius: BorderRadius.circular(
-                          radius * (1 - animation.value),
-                        ),
-                        child: coverChild,
-                      ),
-                      child: Image(
-                        image: _thumbnailProvider(thumbUrl),
-                        fit: BoxFit.cover,
-                      ),
-                    ),
-                  ),
-                ],
+              // animation 为路由原始动画:push 0→1、pop 1→0,值语义
+              // 恒为「0=贴源,1=在查看器」,单套插值覆盖双向
+              return CoverContainFlightImage(
+                image: _thumbnailProvider(thumbUrl),
+                animation: animation,
+                radius: widget.heroSourceRadius,
+                circular: widget.heroSourceCircular,
+                fallback: child,
               );
             },
       child: child,
@@ -279,8 +309,9 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
   /// 的放大浏览下该上限内清晰度无感知差异。
   ImageProvider _clampedViewerProvider(String url) {
     final view = View.of(context);
-    final longestPx =
-        (view.physicalSize.longestSide * 3).clamp(2048.0, 8192.0).round();
+    final longestPx = (view.physicalSize.longestSide * 3)
+        .clamp(2048.0, 8192.0)
+        .round();
     return ResizeImage(
       discourseImageProvider(
         url,
@@ -300,6 +331,12 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
   /// 一次全量解码(原图 jpg/png 尤其疼)。未登记(非帖内入口)退回裸
   /// provider,行为同旧。
   ImageProvider _thumbnailProvider(String url) {
+    // 头像 URL 走 avatarBucket:与页面头像(SmartAvatar)同 bucket 同
+    // key,占位/飞行纹理直接命中已解码缓存(否则 content bucket 视为
+    // 全新资源,首次飞行拿不到纹理退化为无插值)
+    if (url.contains('/user_avatar/')) {
+      return discourseImageProvider(url, bucket: BlobImageCache.avatarBucket);
+    }
     final spec = ImageDecodeSpecMemo.peek(url);
     if (spec == null) return discourseImageProvider(url);
     return ResizeImage(
@@ -337,6 +374,12 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
   @override
   void initState() {
     super.initState();
+    // 图片查看器使用透明路由，底层页面仍会保持可见和Ticker活跃。
+    // 查看大图期间暂停帖子动态内容，避免SVG动画与大图解码/缩放争抢
+    // UI、raster和GPU；关闭查看器后由租约自动恢复。
+    _dynamicContentLease = DynamicContentSuspensionService.instance.acquire(
+      reason: 'image-viewer',
+    );
     currentIndex = widget.initialIndex;
     _activeHeroPage = ValueNotifier(currentIndex);
     // 初始化双击缩放
@@ -350,7 +393,50 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (!identical(route, _route)) {
+      _route?.animation?.removeStatusListener(_onRouteAnimationStatus);
+      _route = route;
+      _route?.animation?.addStatusListener(_onRouteAnimationStatus);
+    }
+    final userGesture = route?.navigator?.userGestureInProgressNotifier;
+    if (!identical(userGesture, _navUserGesture)) {
+      _navUserGesture?.removeListener(_onNavUserGestureChanged);
+      _navUserGesture = userGesture;
+      _navUserGesture?.addListener(_onNavUserGestureChanged);
+    }
+  }
+
+  /// 按钮/程序化 pop:路由动画转 reverse 的第一帧归位缩放,
+  /// 早于 HeroController 对 to 路由的测量与飞行起跳。
+  void _onRouteAnimationStatus(AnimationStatus status) {
+    if (status == AnimationStatus.reverse) {
+      _resetZoomForExit();
+    }
+  }
+
+  /// 预测返回/iOS 拖拽:手势置位即预归位。手势期间查看器整页被
+  /// 转场层拖动,画布级缩放对跟手观感无增益,提前归位换飞行无缝。
+  void _onNavUserGestureChanged() {
+    if (_navUserGesture?.value == true && (_route?.isCurrent ?? false)) {
+      _resetZoomForExit();
+    }
+  }
+
+  void _resetZoomForExit() {
+    final controller = _gestureControllers[currentIndex];
+    final scale = controller?.details?.totalScale ?? 1.0;
+    if (scale == 1.0) return;
+    controller?.reset();
+  }
+
+  @override
   void dispose() {
+    _route?.animation?.removeStatusListener(_onRouteAnimationStatus);
+    _navUserGesture?.removeListener(_onNavUserGestureChanged);
+    _dynamicContentLease.release();
     HeroVisibilityController.instance.clear();
     _activeHeroPage.dispose();
     _galleryPageController?.dispose();
@@ -1366,7 +1452,11 @@ class _ImageDecodeFallbackState extends State<_ImageDecodeFallback> {
 
     // 不是 SVG 也不是 AVIF，显示错误图标
     return const Center(
-      child: Icon(Symbols.broken_image_rounded, size: 64, color: Colors.white54),
+      child: Icon(
+        Symbols.broken_image_rounded,
+        size: 64,
+        color: Colors.white54,
+      ),
     );
   }
 }

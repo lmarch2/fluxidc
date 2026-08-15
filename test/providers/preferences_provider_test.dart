@@ -15,6 +15,25 @@ Future<ProviderContainer> _createContainer({
 }
 
 void main() {
+  test('单次返回退出默认关闭并可以持久化', () async {
+    final container = await _createContainer();
+    addTearDown(container.dispose);
+
+    expect(container.read(preferencesProvider).exitOnSingleBack, isFalse);
+
+    await container
+        .read(preferencesProvider.notifier)
+        .setExitOnSingleBack(true);
+
+    final prefs = container.read(sharedPreferencesProvider);
+    final reloaded = ProviderContainer(
+      overrides: [sharedPreferencesProvider.overrideWithValue(prefs)],
+    );
+    addTearDown(reloaded.dispose);
+
+    expect(reloaded.read(preferencesProvider).exitOnSingleBack, isTrue);
+  });
+
   test('书签默认打开方式默认值为 defaultRoute', () async {
     final container = await _createContainer();
     addTearDown(container.dispose);
@@ -54,5 +73,26 @@ void main() {
       container.read(preferencesProvider).bookmarksOpenMode,
       BookmarksOpenMode.defaultRoute,
     );
+  });
+
+  test('AI 翻译偏好可以持久化并恢复', () async {
+    final container = await _createContainer();
+    addTearDown(container.dispose);
+
+    final notifier = container.read(preferencesProvider.notifier);
+    await notifier.setAiTranslationEnabled(true);
+    await notifier.setAiTranslationTargetLanguage('ja');
+    await notifier.setAiTranslationModelKey('provider:model');
+
+    final prefs = container.read(sharedPreferencesProvider);
+    final reloaded = ProviderContainer(
+      overrides: [sharedPreferencesProvider.overrideWithValue(prefs)],
+    );
+    addTearDown(reloaded.dispose);
+
+    final state = reloaded.read(preferencesProvider);
+    expect(state.aiTranslationEnabled, isTrue);
+    expect(state.aiTranslationTargetLanguage, 'ja');
+    expect(state.aiTranslationModelKey, 'provider:model');
   });
 }

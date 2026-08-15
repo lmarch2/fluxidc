@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:app_icons/app_icons.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -12,10 +14,12 @@ import '../../../utils/time_utils.dart';
 import '../../../widgets/common/relative_time_text.dart';
 import '../../../utils/number_utils.dart';
 import '../../../widgets/topic/topic_notification_button.dart';
+import '../../../widgets/layout/home_workspace_scope.dart';
 import 'topic_vote_button.dart';
 import '../../../widgets/common/topic_badges.dart';
 import '../../category_topics_page.dart';
 import '../../tag_topics_page.dart';
+import '../../../widgets/topic/assign_sheet.dart';
 
 /// 话题详情页头部组件
 class TopicDetailHeader extends ConsumerWidget {
@@ -153,12 +157,20 @@ class TopicDetailHeader extends ConsumerWidget {
                     category: category,
                     faIcon: faIcon,
                     logoUrl: logoUrl,
-                    onTap: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => CategoryTopicsPage(category: category),
-                      ),
-                    ),
+                    onTap: () {
+                      final workspace = HomeWorkspaceScope.maybeOf(context);
+                      if (workspace != null) {
+                        workspace.onShowCategory(category);
+                        return;
+                      }
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) =>
+                              CategoryTopicsPage(category: category),
+                        ),
+                      );
+                    },
                   ),
 
                 // 标签 Badges
@@ -166,17 +178,66 @@ class TopicDetailHeader extends ConsumerWidget {
                   ...detail.tags!.map(
                     (tag) => TagBadge(
                       name: tag.name,
-                      onTap: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => TagTopicsPage(tagName: tag.name),
-                        ),
-                      ),
+                      onTap: () {
+                        final workspace = HomeWorkspaceScope.maybeOf(context);
+                        if (workspace != null) {
+                          workspace.onShowTag(tag.name);
+                          return;
+                        }
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => TagTopicsPage(tagName: tag.name),
+                          ),
+                        );
+                      },
                     ),
                   ),
               ],
             ),
             const SizedBox(height: 16),
+          ],
+
+          // 指定(discourse-assign)标识:有指定对象才显示,点开直接跳到
+          // 指定弹窗——之前只在"更多"菜单的文字里标了状态,标题区域完全
+          // 看不出来,指定完等于白指定。
+          if (detail.isAssigned) ...[
+            InkWell(
+              borderRadius: BorderRadius.circular(16),
+              onTap: () => unawaited(
+                showAssignSheet(context, ref, topicId: detail.id),
+              ),
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primaryContainer.withValues(
+                    alpha: 0.5,
+                  ),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.assignment_ind_rounded,
+                      size: 16,
+                      color: theme.colorScheme.primary,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      '已指定给 '
+                      '${detail.assignedToUser?.displayName ?? detail.assignedToGroupName ?? ''}',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.primary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
           ],
 
           // Metadata Row (Replies, Views, Date, Vote Button)

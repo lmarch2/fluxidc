@@ -3,7 +3,7 @@ import 'dart:async' show Timer;
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/scheduler.dart' show SchedulerBinding, Priority;
+import '../../../utils/idle_task.dart';
 import 'package:app_icons/app_icons.dart';
 import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -18,15 +18,18 @@ import '../../../utils/responsive.dart';
 import '../../../utils/scroll_busy_signal.dart';
 import '../../../utils/time_utils.dart';
 import '../../../widgets/common/anchor_guard_sliver.dart';
+import '../../../widgets/post/post_item/widgets/post_voting_answer_header.dart';
 import 'package:m3e_ui/m3e_ui.dart';
 import 'package:fluxdo_render/fluxdo_render.dart'
     show BlockNode, HtmlChunk, ParagraphWarmup, ParagraphWarmupProbe;
 import '../../../widgets/post/post_item/post_item.dart';
 import '../../../widgets/post/post_item/render_parse_cache.dart';
 import '../../../widgets/post/post_item/segmented_long_post.dart';
+import '../../../widgets/post/small_action_item.dart' show PostTypes;
 import '../../../widgets/post/quote_image_scope.dart';
 import 'topic_detail_header.dart';
 import 'shared_issue_button.dart';
+import 'topic_more_topics.dart';
 import 'typing_indicator.dart';
 import 'pending_posts_section.dart';
 
@@ -106,6 +109,15 @@ class TopicPostList extends StatefulWidget {
   final String? highlightBoostUsername;
   final bool hideHeaderTitle;
 
+  /// 当前用户是否有指定权限(discourse-assign can_assign)——控制每条
+  /// 帖子"更多"菜单里"指定帖子"这一项是否显示。
+  final bool canAssignPost;
+
+  /// 问答话题排序(「N 个回答」头部的按票数/按活动 pill):
+  /// null = 非问答话题不渲染头部
+  final bool isActivitySort;
+  final ValueChanged<bool>? onAnswerSortChanged;
+
   const TopicPostList({
     super.key,
     required this.detail,
@@ -117,6 +129,7 @@ class TopicPostList extends StatefulWidget {
     required this.highlightPostNumber,
     this.highlightBoostUsername,
     this.hideHeaderTitle = false,
+    this.canAssignPost = false,
     required this.isLoggedIn,
     required this.hasMoreBefore,
     required this.hasMoreAfter,
@@ -153,6 +166,8 @@ class TopicPostList extends StatefulWidget {
     this.onShowPostDetail,
     this.onWithdrawPendingPost,
     this.onWithdrawAndEditPendingPost,
+    this.isActivitySort = false,
+    this.onAnswerSortChanged,
   });
 
   @override
@@ -558,11 +573,16 @@ class _TopicPostListState extends State<TopicPostList> {
         }
       }
       if (pending != null) {
-        SchedulerBinding.instance.scheduleTask(() {
-          if (!mounted || generation != _warmUpGeneration) return;
-          pending!.warmUpOneChunk();
-          step();
-        }, Priority.idle);
+        // scheduleIdleTask 是我们自己包的安全版:Flutter 3.44 的
+        // SchedulerBinding.scheduleTask(idle) 撞上持续动画会让事件循环
+        // 忙等活锁(Windows 上表现为窗口卡死),原生 scheduleTask 不能用。
+        scheduleIdleTask(
+          () {
+            pending!.warmUpOneChunk();
+            step();
+          },
+          isCanceled: () => !mounted || generation != _warmUpGeneration,
+        );
         return;
       }
       // ---- 级 2:方向前方楼层的段落 flatten + 排版 ----
@@ -587,8 +607,11 @@ class _TopicPostListState extends State<TopicPostList> {
         ? 0
         : (_postNumberToIndex[anchorNumber] ?? 0);
     // 游标续跑:同一楼层没热完接着热,否则从锚点楼层往后找。
-    SchedulerBinding.instance.scheduleTask(() {
-      if (!mounted || generation != _warmUpGeneration) return;
+    // scheduleIdleTask 是我们自己包的安全版,原因见 _scheduleChunkWarmUp
+    // 顶部注释(原生 SchedulerBinding.scheduleTask(idle) 撞持续动画会
+    // 活锁)。
+    scheduleIdleTask(
+      () {
       // 找目标楼层:游标楼层仍有效则续,否则从 startIndex 起第一个
       // 已有解析产物的楼层(不为预热触发解析 —— 短帖解析很便宜但
       // 语义上归级 1/首建;这里只吃现成 AST)。
@@ -642,7 +665,9 @@ class _TopicPostListState extends State<TopicPostList> {
         _warmNodeCursor = next;
       }
       _scheduleParagraphWarmUp(generation); // 下一 idle 步
-    }, Priority.idle);
+      },
+      isCanceled: () => !mounted || generation != _warmUpGeneration,
+    );
   }
 
   /// 楼层的现成 AST(只取已解析的,不触发解析):
@@ -746,7 +771,16 @@ class _TopicPostListState extends State<TopicPostList> {
       final longPostCache = _longPostDataFor(post);
       newEngineData = longPostCache.newEngineData;
       longChunks = longPostCache.chunks;
-      final useLongSegments = longChunks.isNotEmpty;
+      // discourse-assign 等插件的指定/取消指定系统帖,cooked 里塞几十个
+      // emoji <img> 就很容易超过长帖分段阈值——这条 chunk 化直出路径是
+      // topic_post_list.dart 自己直接调 LongPostHeaderSegment/Footer,完全
+      // 绕过 PostItem.build() 里"是不是系统操作帖"的判断,系统帖一旦被
+      // 判成"长帖"就会被当成能点赞/回复的普通帖子整个渲染出来。系统帖
+      // 永远走 shortPost(内部再分流到 SmallActionItem),不参与长帖分段。
+      final bool isSystemActionPost =
+          post.postType == PostTypes.smallAction ||
+          (post.actionCode?.isNotEmpty ?? false);
+      final useLongSegments = !isSystemActionPost && longChunks.isNotEmpty;
 
       postIndexToScrollIndex[postIndex] = segments.length;
       postNumberToIndex[post.postNumber] = postIndex;
@@ -933,7 +967,7 @@ class _TopicPostListState extends State<TopicPostList> {
     final generation = ++_parseWarmUpGeneration;
     var index = 0;
     void step() {
-      SchedulerBinding.instance.scheduleTask(() {
+      scheduleIdleTask(() {
         if (!mounted || generation != _parseWarmUpGeneration) return;
         if (ScrollBusySignal.isBusy) {
           _parseWarmUpRetry?.cancel();
@@ -952,7 +986,7 @@ class _TopicPostListState extends State<TopicPostList> {
           break;
         }
         if (index < posts.length) step();
-      }, Priority.idle);
+      });
     }
 
     step();
@@ -1256,6 +1290,17 @@ class _TopicPostListState extends State<TopicPostList> {
                   return const SliverToBoxAdapter(child: SizedBox.shrink());
                 },
               ),
+
+            // 帖子流末尾的推荐区(相关话题 / 建议话题),对齐网页版
+            // more-topics:只在已加载到话题末尾时出现
+            if (!hasMoreAfter)
+              SliverToBoxAdapter(
+                child: _wrapContent(
+                  context,
+                  MoreTopicsSection(detail: detail),
+                ),
+              ),
+
             SliverPadding(
               padding: EdgeInsets.only(
                 bottom: 80 + MediaQuery.of(context).padding.bottom,
@@ -1327,6 +1372,16 @@ class _TopicPostListState extends State<TopicPostList> {
     final Widget? opSlot = (post.postNumber == 1 && detail.sharedIssueVisible)
         ? SharedIssueButton(topic: detail, onChanged: onSharedIssueChanged)
         : null;
+    // 问答话题:「N 个回答」头部渲染在第一个答案上方(问题帖紧邻其后
+    // 的那一帖;仅问题帖已加载时才有可见的问题/答案分界)。挂在该帖
+    // 首个段(shortPost 或长帖 header)顶部。
+    final bool showAnswerHeader =
+        detail.isPostVoting &&
+        post.postNumber != 1 &&
+        postIndex > 0 &&
+        posts_[postIndex - 1].postNumber == 1 &&
+        (segment.type == _PostRenderSegmentType.shortPost ||
+            segment.type == _PostRenderSegmentType.longHeader);
     final Widget child;
 
     switch (segment.type) {
@@ -1360,6 +1415,8 @@ class _TopicPostListState extends State<TopicPostList> {
           onQuoteImage: onQuoteImage,
           onExpandHiddenPost: onExpandHiddenPost,
           useReplyDialog: useReplyDialog,
+          assignmentInfo: detail.indirectlyAssignedTo[post.id],
+          canAssignPost: widget.canAssignPost,
           topicTitle: detail.title,
           isPrivateMessageTopic: detail.isPrivateMessage,
           isPmWithNonHumanUser: detail.pmWithNonHumanUser,
@@ -1367,6 +1424,8 @@ class _TopicPostListState extends State<TopicPostList> {
               ? () => widget.onShowPostDetail!(post)
               : null,
           opTopSlot: opSlot,
+          isPostVotingTopic: detail.isPostVoting,
+          topicClosed: detail.closed || detail.archived,
         );
 
         // OP 楼的 opSlot 依赖整个 detail 对象,签名无法稳定,不缓存
@@ -1395,6 +1454,8 @@ class _TopicPostListState extends State<TopicPostList> {
           pmNonHuman: detail.pmWithNonHumanUser,
           canShareAsImage: onShareAsImage != null,
           canShowDetail: widget.onShowPostDetail != null,
+          isPostVoting: detail.isPostVoting,
+          topicClosed: detail.closed || detail.archived,
         );
         final cached = _shortPostCache[post.id];
         if (cached != null && cached.signature == signature) {
@@ -1498,6 +1559,8 @@ class _TopicPostListState extends State<TopicPostList> {
               ? () => widget.onShowPostDetail!(post)
               : null,
           opTopSlot: opSlot,
+          isPostVotingTopic: detail.isPostVoting,
+          topicClosed: detail.closed || detail.archived,
         );
         break;
       case _PostRenderSegmentType.gapBefore:
@@ -1526,7 +1589,21 @@ class _TopicPostListState extends State<TopicPostList> {
         // 常驻 DecoratedBoxTransition 包装(项目不用包的 highlight 功能,
         // 楼层高亮是 PostItem 自己的 highlight 参数),每帖少一层
         // transition + tween 求值
-        builder: (context, animation) => child,
+        builder: (context, animation) => showAnswerHeader
+            ? Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  PostVotingAnswerHeader(
+                    // 答案数 = 总帖数 - 1(减问题帖,官方同口径)
+                    answerCount: (detail.postsCount - 1).clamp(0, 999999),
+                    isActivityMode: widget.isActivitySort,
+                    onSortChanged: (byActivity) =>
+                        widget.onAnswerSortChanged?.call(byActivity),
+                  ),
+                  child,
+                ],
+              )
+            : child,
       ),
     );
 

@@ -5,10 +5,15 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 import '../models/topic.dart';
 import '../navigation/nav_action_bus.dart';
+import '../providers/selected_topic_provider.dart';
 import '../providers/user_content_providers.dart';
 import '../providers/preferences_provider.dart';
+import '../providers/shortcut_provider.dart';
 import '../utils/load_more_coordinator.dart';
 import '../widgets/common/paged_list_footer.dart';
+import '../widgets/layout/master_detail_layout.dart';
+import '../widgets/layout/pane_projection_back_scope.dart';
+import '../widgets/topic/topic_card_prewarmer.dart';
 import '../widgets/topic/topic_item_builder.dart';
 import '../widgets/topic/topic_list_skeleton.dart';
 import '../widgets/post/reply_sheet.dart';
@@ -16,6 +21,7 @@ import '../widgets/common/error_view.dart';
 import '../widgets/desktop_refresh_indicator.dart';
 import '../l10n/s.dart';
 import 'topic_detail_page/topic_detail_page.dart';
+import 'topics_screen.dart' show PaneContentWidget;
 
 /// 内部 tab 动作：外层根据当前激活 filter 派发给对应子 widget。
 /// 用 nonce 让连续同类事件也能触发 Riverpod 监听。
@@ -50,6 +56,43 @@ class _PrivateMessagesPageState extends ConsumerState<PrivateMessagesPage>
     with SingleTickerProviderStateMixin {
   late final TabController _tabController;
 
+  /// 桌面 ESC 两段式:右栏/投影开着→分发落 detail scope(关右栏);空态→
+  /// 注册 maybePop。底栏 tab 形态是首路由,maybePop 为 no-op。
+  late final PaneHostEscBinding _escBinding = PaneHostEscBinding(
+    ref: ref,
+    enabled: () => widget.isActive,
+  );
+
+  /// 平行视界第 [index] 层格(0=栈底):胶片带模型,每层一格恒驻,
+  /// 压栈=倒二格滑去左栏当预览(State 全保),退栈=滑回。
+  Widget _buildPaneCell(SelectedTopicState selectedMessage, int index) {
+    final entry = selectedMessage.stack[index];
+    final isTop = index == selectedMessage.stack.length - 1;
+    final key = entry.kind == PaneKind.topic
+        ? ValueKey('pm_pane_${entry.topicId}_${entry.instanceId ?? ''}')
+        : ValueKey('pm_pane_${entry.kind}_${entry.username}');
+    return KeyedSubtree(
+      key: key,
+      child: PaneContentWidget(
+        entry: entry,
+        stackProvider: selectedMessageProvider,
+        parentActive: widget.isActive,
+        truncateOnPush: !isTop,
+        // 基础层也给 clear：ESC/返回按钮清空右栏回到空态，与
+        // search/seeking 一致（平行视界 ESC 统一）。回调内重读
+        // provider，不闭包捕获 build 时的快照。
+        onBack: () {
+          final notifier = ref.read(selectedMessageProvider.notifier);
+          if (ref.read(selectedMessageProvider).isStacked) {
+            notifier.pop();
+          } else {
+            notifier.clear();
+          }
+        },
+      ),
+    );
+  }
+
   static const _filters = [
     PrivateMessageFilter.inbox,
     PrivateMessageFilter.sent,
@@ -64,6 +107,7 @@ class _PrivateMessagesPageState extends ConsumerState<PrivateMessagesPage>
 
   @override
   void dispose() {
+    _escBinding.dispose();
     _tabController.dispose();
     super.dispose();
   }
@@ -114,7 +158,7 @@ class _PrivateMessagesPageState extends ConsumerState<PrivateMessagesPage>
       );
     });
 
-    return NotificationListener<ScrollNotification>(
+    final listScaffold = NotificationListener<ScrollNotification>(
       onNotification: _onScrollNotification,
       child: Scaffold(
         appBar: AppBar(
@@ -143,6 +187,33 @@ class _PrivateMessagesPageState extends ConsumerState<PrivateMessagesPage>
           tooltip: context.l10n.pm_newTitle,
           child: const Icon(Icons.edit_rounded),
         ),
+      ),
+    );
+
+    // 平行视界：宽屏双栏下私信列表跟话题列表一样，走独立的
+    // selectedMessageProvider 导航栈;窄屏栈非空时详情在本页体内全宽
+    // 投影(栈是唯一真相,不 push 合成路由,宽窄切换 State 原地保留)。
+    final selectedMessage = ref.watch(selectedMessageProvider);
+    // ESC:栈非空(右栏开着/投影着)都让分发落 detail scope。
+    _escBinding.sync(context, paneOpen: selectedMessage.hasSelection);
+
+    // 左栏本质是不是"列表"（私信列表）——决定给窄栏还是对半分。
+    final masterIsListLike = !selectedMessage.isStacked;
+    return PaneProjectionBackScope(
+      stackProvider: selectedMessageProvider,
+      isActive: widget.isActive,
+      child: MasterDetailLayout(
+        maxMasterRatio: masterIsListLike
+            ? MasterDetailLayout.defaultMaxMasterRatio
+            : 0.8,
+        preferredMasterRatio: masterIsListLike ? 0.25 : 0.5,
+        projectDetailWhenNarrow: true,
+        pinMaster: false,
+        master: listScaffold,
+        panes: [
+          for (var i = 0; i < selectedMessage.stack.length; i++)
+            _buildPaneCell(selectedMessage, i),
+        ],
       ),
     );
   }
@@ -238,6 +309,15 @@ class _PrivateMessageTabViewState extends ConsumerState<_PrivateMessageTabView>
   }
 
   void _onItemTap(Topic topic) {
+    final canShowDetailPane = MasterDetailLayout.canShowBothPanesFor(context);
+    if (canShowDetailPane) {
+      ref.read(selectedMessageProvider.notifier).select(
+            topicId: topic.id,
+            initialTitle: topic.title,
+            scrollToPostNumber: topic.lastReadPostNumber,
+          );
+      return;
+    }
     Navigator.push(
       context,
       MaterialPageRoute(
@@ -302,7 +382,10 @@ class _PrivateMessageTabViewState extends ConsumerState<_PrivateMessageTabView>
             );
           }
 
-          return ListView.builder(
+          return TopicCardPrewarmScope(
+            topics: topics,
+            messageStyle: true,
+            child: ListView.builder(
             controller: _scrollController,
             // 底部让出 extendBody 注入的底栏高度
             padding: EdgeInsets.fromLTRB(
@@ -321,16 +404,18 @@ class _PrivateMessageTabViewState extends ConsumerState<_PrivateMessageTabView>
               final enableLongPress = ref
                   .watch(preferencesProvider)
                   .longPressPreview;
+              final selectedTopicId = ref.watch(selectedMessageProvider).topicId;
               return buildTopicItem(
                 context: context,
                 topic: topic,
-                isSelected: false,
+                isSelected: selectedTopicId == topic.id,
                 onTap: () => _onItemTap(topic),
                 enableLongPress: enableLongPress,
                 // 私信语义同邮件:发件人优先的 Gmail 式布局
                 messageStyle: true,
               );
             },
+            ),
           );
         },
         loading: () => const TopicListSkeleton(messageStyle: true),

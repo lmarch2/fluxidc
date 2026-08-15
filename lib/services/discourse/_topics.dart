@@ -228,11 +228,16 @@ mixin _TopicsMixin on _DiscourseServiceBase {
   }
 
   /// 批量获取帖子内容
-  Future<PostStream> getPosts(int topicId, List<int> postIds) async {
+  ///
+  /// [includeSuggested] 对齐网页版 post-stream 的 `include_suggested`:话题
+  /// 详情首屏未到末尾时服务端不下发推荐话题,靠翻页请求补一次(已拿到就别
+  /// 再要,服务端每次都要多跑一轮 TopicQuery)。
+  Future<PostStream> getPosts(int topicId, List<int> postIds, {bool includeSuggested = false}) async {
     final response = await _dio.get<String>(
       '/t/$topicId/posts.json',
       queryParameters: {
         'post_ids[]': postIds,
+        if (includeSuggested) 'include_suggested': 'true',
       },
       options: Options(responseType: ResponseType.plain),
     );
@@ -240,12 +245,13 @@ mixin _TopicsMixin on _DiscourseServiceBase {
   }
 
   /// 按帖子编号获取帖子
-  Future<PostStream> getPostsByNumber(int topicId, {required int postNumber, required bool asc}) async {
+  Future<PostStream> getPostsByNumber(int topicId, {required int postNumber, required bool asc, bool includeSuggested = false}) async {
     final response = await _dio.get<String>(
       '/t/$topicId/posts.json',
       queryParameters: {
         'post_number': postNumber,
         'asc': asc,
+        if (includeSuggested) 'include_suggested': 'true',
       },
       options: Options(responseType: ResponseType.plain),
     );
@@ -274,6 +280,7 @@ mixin _TopicsMixin on _DiscourseServiceBase {
     required String raw,
     required int categoryId,
     List<String>? tags,
+    bool createAsPostVoting = false,
   }) async {
     final data = <String, dynamic>{
       'title': title,
@@ -284,6 +291,11 @@ mixin _TopicsMixin on _DiscourseServiceBase {
 
     if (tags != null && tags.isNotEmpty) {
       data['tags[]'] = tags;
+    }
+
+    // post-voting(问答)话题:插件只认字符串 'true',且仅对新话题生效
+    if (createAsPostVoting) {
+      data['create_as_post_voting'] = 'true';
     }
 
     final response = await _dio.post(
@@ -351,6 +363,16 @@ mixin _TopicsMixin on _DiscourseServiceBase {
     await _dio.put(
       '/topics/bulk.json',
       data: data,
+    );
+  }
+
+  /// 标记话题为未读（对齐官方 deferTopic:DELETE /t/:id/timings?last=1,
+  /// 服务端把 last_read_post_number 回退到最高楼层号 - 1)。
+  /// [all] = true 时不带 last=1,服务端 destroy_for 删除全部 PostTiming
+  /// 和 TopicUser,话题回到「从没读过」的 NEW 态,再进从头读。
+  Future<void> markTopicUnread(int topicId, {bool all = false}) async {
+    await _dio.delete(
+      all ? '/t/$topicId/timings.json' : '/t/$topicId/timings.json?last=1',
     );
   }
 
@@ -508,7 +530,18 @@ PostStream _parsePostStreamJson(String body) {
     data,
     streamJson['posts'] as List<dynamic>?,
   );
-  return postStream;
+  // 推荐话题挂在响应顶层(与 post_stream 同级),仅 include_suggested=true
+  // 的请求才有;没有就原样返回,不必重建对象。
+  final suggested = parseSuggestedTopicList(data['suggested_topics']);
+  final related = parseSuggestedTopicList(data['related_topics']);
+  if (suggested.isEmpty && related.isEmpty) return postStream;
+  return PostStream(
+    posts: postStream.posts,
+    stream: postStream.stream,
+    gaps: postStream.gaps,
+    suggestedTopics: suggested,
+    relatedTopics: related,
+  );
 }
 
 /// isolate 入口:话题列表响应构造

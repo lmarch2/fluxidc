@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/lmarch2/fluxidc/releases"><img src="https://img.shields.io/github/v/release/lmarch2/fluxidc?label=release" alt="GitHub Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/lmarch2/fluxidc" alt="License"></a>
-  <img src="https://img.shields.io/badge/Flutter-3.44.0-02569B?logo=flutter" alt="Flutter 3.44.0">
+  <img src="https://img.shields.io/badge/Flutter-3.44.8-02569B?logo=flutter" alt="Flutter 3.44.8">
   <img src="https://img.shields.io/badge/platform-Android%20%7C%20iOS%20%7C%20macOS%20%7C%20Windows%20%7C%20Linux-555" alt="支持平台">
 </p>
 
@@ -22,7 +22,7 @@
   <a href="UPSTREAM.md">上游说明</a>
 </p>
 
-FluxIDC 基于 [FluxDO](https://github.com/Lingyan000/fluxdo) v0.2.25 适配，保留其 Flutter、Discourse、WebView 登录和 Cookie 同步能力，并将站点、品牌、深链及平台包名切换到 IDC Flare。
+FluxIDC 基于 [FluxDO](https://github.com/Lingyan000/fluxdo) v0.2.26 适配，保留其 Flutter、Discourse、WebView 登录和 Cookie 同步能力，并将站点、品牌、深链及平台包名切换到 IDC Flare。
 
 > [!IMPORTANT]
 > 本项目是社区维护的非官方客户端，与 IDC Flare 官方及 FluxDO 上游作者均无隶属关系。使用前请自行判断风险并妥善保管账号数据。IDC Flare 名称与图形标志归其权利人所有。
@@ -42,7 +42,7 @@ Android 安装包按 ABI 分开构建：
 下载对应 APK 后，可直接在系统文件管理器中打开安装，或使用 ADB：
 
 ```bash
-adb install -r FluxIDC-0.2.25-arm64-v8a.apk
+adb install -r FluxIDC-0.2.26-arm64-v8a.apk
 ```
 
 未配置 Android 签名 secrets 时，CI 和本地 release 构建会回退到调试签名。不同签名的 APK 不能直接覆盖安装；遇到签名冲突时，应先备份应用数据，再卸载旧版本。
@@ -72,7 +72,7 @@ iOS Release 提供 arm64、最低 iOS 14.0 的 unsigned IPA。该文件不包含
 
 ## 从源码构建
 
-需要 Flutter `3.44.0`、Dart SDK `^3.10.4`、Rust stable，以及目标平台对应的原生工具链。克隆时需要同时拉取子模块：
+需要 Flutter `3.44.8`、Dart SDK `^3.10.4`、Rust stable，以及目标平台对应的原生工具链。克隆时需要同时拉取子模块：
 
 ```bash
 git clone --recurse-submodules https://github.com/lmarch2/fluxidc.git
@@ -117,3 +117,7 @@ IDC Flare 常量位于 `lib/constants.dart`，站点能力与安全域名配置�
 ## 上游与许可证
 
 本项目基于 FluxDO 修改，具体基线、子模块版本和保留项见 [UPSTREAM.md](UPSTREAM.md)。源代码继续使用 [GNU GPL v3](LICENSE)；分发修改版本时须遵守 GPL-3.0 的源码和许可证要求，并保留上游署名。
+
+## 社区
+
+感谢 [LINUX DO](https://linux.do/) 社区和 [IDC Flare](https://idcflare.com/) 社区对开源交流和项目成长的支持。

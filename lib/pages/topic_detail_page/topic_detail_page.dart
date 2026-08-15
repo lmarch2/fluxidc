@@ -5,7 +5,8 @@ import '../../services/app_error_handler.dart';
 import '../../services/notion/notion_bookmark_auto_sync.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show RenderSliver, RenderViewport;
-import 'package:flutter/scheduler.dart' show SchedulerBinding, Priority;
+import 'package:flutter/services.dart';
+import '../../utils/idle_task.dart';
 import 'package:app_icons/app_icons.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:scroll_to_index/scroll_to_index.dart';
@@ -17,6 +18,7 @@ import '../../utils/html_to_markdown.dart';
 import '../../utils/code_selection_context.dart';
 import '../../utils/link_launcher.dart';
 import '../../utils/quote_builder.dart';
+import '../../utils/scroll_jump.dart';
 import 'package:fluxdo_render/fluxdo_render.dart' show SelectionCoordinator;
 import 'package:uuid/uuid.dart';
 import 'dart:async';
@@ -35,6 +37,7 @@ import '../../providers/discourse_providers.dart';
 import '../../providers/message_bus_providers.dart';
 import '../../providers/pinned_categories_provider.dart';
 import '../../services/discourse/discourse_service.dart';
+import '../../services/preloaded_data_service.dart';
 import '../../services/screen_track.dart';
 import '../../services/toast_service.dart';
 import '../../services/log/log_writer.dart';
@@ -79,6 +82,7 @@ import '../../utils/platform_utils.dart';
 import '../../models/shortcut_binding.dart';
 import '../../providers/shortcut_provider.dart';
 import '../../widgets/desktop_refresh_indicator.dart';
+import '../../widgets/topic/assign_sheet.dart';
 
 part 'actions/_scroll_actions.dart';
 part 'actions/_user_actions.dart';
@@ -92,7 +96,15 @@ class TopicDetailPage extends ConsumerStatefulWidget {
   final bool embeddedMode; // 嵌入模式（双栏布局中使用，不显示返回按钮）
   final bool parentActive; // 父容器是否可见（IndexedStack/双栏切 tab 时用）
   final bool autoSwitchToMasterDetail; // 仅在从首页进入时允许自动切换
+  final bool restoreExistingPaneStack; // 宽屏缩窄产生的临时路由，恢复时保留原栈
+  final VoidCallback? restoreParentPaneStack; // 恢复前先还原下层临时路由的平行视界栈
   final bool autoOpenReply; // 自动打开回复框（从草稿进入时使用）
+
+  /// 自动回复意图**已消费**：调用方应把它从状态源头清掉。
+  ///
+  /// [_autoOpenReplyHandled] 只是 State 字段，面板一重建就重置，拦不住
+  /// 重复弹出（实测发完私信回复框又弹一次）。
+  final VoidCallback? onAutoReplyConsumed;
   final int? autoReplyToPostNumber; // 自动回复的帖子编号（从草稿进入时使用）
   final String? instanceId; // 外部指定的 provider 实例 ID（布局切换时复用）
   final bool autoOpenAiChat; // 自动打开 AI 聊天面板
@@ -113,17 +125,33 @@ class TopicDetailPage extends ConsumerStatefulWidget {
   final VoidCallback? onEmbeddedShowTabs;
   final bool hideInlineHeaderTitle;
 
+  /// 平行视界导航栈：内部链接点击或全屏路由恢复时使用的目标 provider。
+  /// 默认 [selectedTopicProvider]（首页话题列表）；私信详情面板传
+  /// [selectedMessageProvider]，保证两套历史互不干扰。
+  final SelectedTopicProvider? stackProvider;
+
+  /// master 面板显示"上一层预览"时传 true：这层内容不是当前可交互的
+  /// 栈顶，内部链接点击应该"替换右侧正显示的那层"（截断栈顶后压入），
+  /// 而不是在已经很深的栈上继续叠层——见
+  /// [EmbeddedStackScope.truncateOnPush] 的注释。
+  final bool truncateOnPush;
+
   const TopicDetailPage({
     super.key,
     required this.topicId,
     this.initialTitle,
     this.scrollToPostNumber,
     this.embeddedMode = false,
+    this.truncateOnPush = false,
     this.parentActive = true,
     this.autoSwitchToMasterDetail = false,
+    this.restoreExistingPaneStack = false,
+    this.restoreParentPaneStack,
     this.autoOpenReply = false,
+    this.onAutoReplyConsumed,
     this.autoReplyToPostNumber,
     this.instanceId,
+    this.stackProvider,
     this.autoOpenAiChat = false,
     this.initialSessionId,
     this.highlightBoostUsername,
@@ -146,6 +174,8 @@ class TopicDetailPage extends ConsumerStatefulWidget {
 
 class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin, RouteAware {
+  late ProviderContainer _providerContainer;
+
   /// 唯一实例 ID，确保每次打开页面都创建新的 provider 实例
   /// 支持外部传入以在布局切换时复用同一个 provider
   late final String _instanceId = widget.instanceId ?? const Uuid().v4();
@@ -195,9 +225,12 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
   bool _isSwitchingMode = false; // 切换热门回复模式
   bool _isNestedView = false; // 嵌套视图模式
   bool _defaultNestedViewApplied = false; // 默认嵌套视图配置是否已应用（依赖 detail 加载后判定）
+  int? _nestedTargetPostNumber; // 树形 context 定位的目标楼层（通知等带楼层进入）
+  bool _nestedAutoEnabled = false; // 树形视图是否为默认配置自动开启（失败时静默回落平铺）
+  bool _nestedFallbackNotified = false; // 回落提示只弹一次
   // 搜索相关
   final TextEditingController _searchController = TextEditingController();
-  final FocusNode _searchFocusNode = FocusNode();
+  late final FocusNode _searchFocusNode;
   late final AnimationController _expandController;
   late final Animation<Offset> _animation;
   Set<int> _lastReadPostNumbers = {};
@@ -217,6 +250,11 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
   late final ShortcutScopeBinding _shortcutScopeBinding = ShortcutScopeBinding(
     ref: ref,
     scope: widget.embeddedMode ? ShortcutScope.detail : ShortcutScope.context,
+    // 嵌入面板挂在 IndexedStack 常驻 tab 里(首页/私信/草稿…各自的
+    // detail),切走 tab 后 State 仍存活、注册仍在——不按宿主活跃状态
+    // 失效的话,先注册的那个 tab 会一直霸占 detail scope,其他 tab 的
+    // ESC/快捷键全部被截胡(实测:私信 ESC 失效,被首页详情吃掉)。
+    enabled: () => !widget.embeddedMode || widget.parentActive,
   );
   late int? _fallbackBookmarkId = widget.initialBookmarkId;
   late String? _fallbackBookmarkName = widget.initialBookmarkName;
@@ -261,6 +299,7 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
     WidgetsBinding.instance.addObserver(this);
     _isParentActive = widget.parentActive;
     _providerPostNumber = widget.scrollToPostNumber;
+    _searchFocusNode = FocusNode(onKeyEvent: _handleSearchKeyEvent);
 
     _expandController = AnimationController(
       vsync: this,
@@ -293,22 +332,39 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
         debugPrint(
           '[TopicDetail] onTimingsSent callback triggered: topicId=$topicId, highestSeen=$highestSeen',
         );
+        final container = _providerContainer;
         // 更新会话已读状态，触发 PostItem 消除未读圆点
-        ref
+        container
             .read(topicSessionProvider(topicId).notifier)
             .markAsRead(postNumbers);
-        // 遍历所有分类 tab 更新列表页 lastReadPostNumber。会重建栈底的
-        // 列表页,推迟到 idle 执行,避免上报回调恰好落在滚动帧内造成掉帧
-        SchedulerBinding.instance.scheduleTask(() {
+        // 先只更新一份全局追踪状态。之前在每个分类列表的 updateSeen 内
+        // 重复写一次，还会因为 ref.read(notifier) 初始化从未打开过的
+        // provider，导致一次阅读上报并发加载全部置顶分类。
+        scheduleIdleTask(() {
           if (!mounted) return;
-          final pinnedIds = ref.read(pinnedCategoriesProvider);
+          final tracked = container.read(topicTrackingStateProvider)[topicId];
+          if (tracked != null) {
+            container
+                .read(topicTrackingStateProvider.notifier)
+                .updateTopicRead(
+                  topicId,
+                  highestSeen,
+                  tracked.highestPostNumber,
+                );
+          }
+
+          // 只更新已经存在的列表 provider；未打开的分类没有 UI 状态需要
+          // 同步，绝不能为了一次本地字段更新触发网络初始化。
+          final pinnedIds = container.read(pinnedCategoriesProvider);
           final categoryIds = [null, ...pinnedIds];
           for (final categoryId in categoryIds) {
-            ref
-                .read(topicListProvider(categoryId).notifier)
-                .updateSeen(topicId, highestSeen);
+            final provider = topicListProvider(categoryId);
+            if (!container.exists(provider)) continue;
+            container
+                .read(provider.notifier)
+                .updateSeen(topicId, highestSeen, updateTracking: false);
           }
-        }, Priority.idle);
+        });
       },
     );
 
@@ -395,7 +451,9 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
 
   void _onScrollIdle() {
     if (!mounted) return;
-    if (_idleFlushPosition?.isScrollingNotifier.value ?? true) return;
+    final scrolling =
+        _idleFlushPosition?.isScrollingNotifier.value ?? true;
+    if (scrolling) return;
     if (_deferredPostUpdates.isEmpty) return;
     // 推迟一帧回放:isScrollingNotifier 翻 false 发生在惯性最后一个 tick
     // 的同一帧,若同帧内直接回放,布局时 pixels 相对上一帧仍在变,
@@ -522,15 +580,65 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
         unawaited(_handleDeletePost(post));
       },
     };
-    final registeredShortcuts = widget.embeddedMode
-        ? shortcuts
-        : {
-            ...shortcuts,
-            ShortcutAction.closeOverlay: () {
-              if (mounted) Navigator.of(context).maybePop();
-            },
-          };
-    _shortcutScopeBinding.register(context, registeredShortcuts);
+    // Esc 优先退出页内搜索/AI，再按当前布局执行嵌入返回或路由返回。
+    // （_handleCloseShortcut 的嵌入分支会调 onEmbeddedBack——压栈时退回
+    // 上一层,基础层清空右栏回空态,与返回按钮一致。）
+    //
+    // 预览位例外:master 槽里的"上一层预览"(embeddedMode 且
+    // onEmbeddedBack 为 null)不注册 closeOverlay——嵌入分支的关闭动作
+    // 就是 onEmbeddedBack,为 null 时回调是空操作,却会在 detail scope
+    // 合并时以更晚的注册序(本页滚动等事件会反复重注册)盖掉真正 detail
+    // 面板的关闭回调,表现为 ESC 被吃掉但什么都不发生(时灵时不灵取决
+    // 于两个面板谁后注册)。
+    final registeredShortcuts = {
+      ...shortcuts,
+      if (!widget.embeddedMode || widget.onEmbeddedBack != null)
+        ShortcutAction.closeOverlay: _handleCloseShortcut,
+    };
+    _shortcutScopeBinding.registerForRoute(_route, registeredShortcuts);
+  }
+
+  void _exitSearchMode() {
+    _searchController.clear();
+    ref.read(topicSearchProvider(widget.topicId).notifier).exitSearchMode();
+  }
+
+  void _returnFromAiPage() {
+    _pageController.animateToPage(
+      0,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  void _handleCloseShortcut() {
+    if (!mounted) return;
+    if (ref.read(topicSearchProvider(widget.topicId)).isSearchMode) {
+      _exitSearchMode();
+      return;
+    }
+    if (_currentPageNotifier.value != 0) {
+      _returnFromAiPage();
+      return;
+    }
+    if (widget.embeddedMode) {
+      // 嵌入模式统一走宿主传入的 onEmbeddedBack:压栈时 pop 一层,基础层
+      // clear 清空右栏回空态(首页/私信/搜索/追觅四家现已统一为恒非
+      // null)。不能落到 maybePop:嵌入面板不是独立路由,pop 的会是宿主
+      // 页面(如整个书签页)。
+      widget.onEmbeddedBack?.call();
+      return;
+    }
+    Navigator.of(context).maybePop();
+  }
+
+  KeyEventResult _handleSearchKeyEvent(FocusNode _, KeyEvent event) {
+    if (event is! KeyDownEvent ||
+        event.logicalKey != LogicalKeyboardKey.escape) {
+      return KeyEventResult.ignored;
+    }
+    _exitSearchMode();
+    return KeyEventResult.handled;
   }
 
   void _schedulePostShortcutRegistration() {
@@ -565,7 +673,21 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
     if (oldWidget.topicId == widget.topicId &&
         oldWidget.scrollToPostNumber != widget.scrollToPostNumber &&
         widget.scrollToPostNumber != null &&
-        widget.scrollToPostNumber! > 0) {
+        widget.scrollToPostNumber! > 0 &&
+        // 自回流守卫:双栏包装层每次 build 都把 detailScrollPositionProvider
+        // (本页 eyeline 自己上报的浏览位置)现读回传为 scrollToPostNumber,
+        // 用于面板槽位搬动重建时恢复位置。State 存活期间收到与上报值相同
+        // 的参数变化只是这条恢复通道的回声,不是外部跳转指令 —— 不挡住的
+        // 话,boost 弹层等任何 push 引发的外层 rebuild 都会在初次加载后
+        // 触发一次假跳转 + 高亮。真正的外部跳转(搜索结果/通知点进同话题
+        // 其他楼层)目标必不等于当前上报位置,不受影响。
+        widget.scrollToPostNumber !=
+            ref.read(
+              detailScrollPositionProvider((
+                topicId: widget.topicId,
+                instanceId: _instanceId,
+              )),
+            )) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         unawaited(
@@ -578,6 +700,7 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    _providerContainer = ProviderScope.containerOf(context, listen: false);
     final route = ModalRoute.of(context);
     if (route == _route || route == null) return;
 
@@ -734,7 +857,12 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
       // header 不在视图中（未加载或滚动到了远处）
       // 如果滚动位置在顶部附近（比如刚切换视图模式），header 很快就会出现，
       // 先设为不可见状态，等 header 渲染后由滚动事件再次触发更新
+      //
+      // 注意:列表是 center 锚定的(进入点楼层 offset = 0,向上为负),
+      // 第一页未加载时 header 不存在且上方必有更早楼层,offset≈0 并不
+      // 代表真的在话题顶部,此时应恒定视为 scrolled under
       final atTop =
+          _hasFirstPost &&
           _controller.scrollController.hasClients &&
           _controller.scrollController.offset <= barHeight;
       if (atTop) {
@@ -809,24 +937,67 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
         return;
       }
 
-      final currentPostNumber = _resolvedViewportPostNumber;
-      ref
-          .read(selectedTopicProvider.notifier)
-          .select(
-            topicId: widget.topicId,
-            // 切换瞬间现读即可,不需要 build 期持有 detail(顶层已不再
-            // watch 完整 detail,见 build 内注释)
-            initialTitle:
-                ref.read(topicDetailProvider(_params)).value?.title ??
-                widget.initialTitle,
-            scrollToPostNumber: currentPostNumber,
-            instanceId: _instanceId,
-          );
+      final stackProvider = widget.stackProvider ?? selectedTopicProvider;
+      final stackNotifier = ref.read(stackProvider.notifier);
+      _syncTopicToPaneStack(stackNotifier);
       navigator.pop();
     });
   }
 
+  void _syncTopicToPaneStack(SelectedTopicNotifier stackNotifier) {
+    final currentPostNumber = _resolvedViewportPostNumber;
+    // 切换瞬间现读即可,不需要 build 期持有 detail(顶层已不再
+    // watch 完整 detail,见 build 内注释)
+    final title =
+        ref.read(topicDetailProvider(_params)).value?.title ??
+        widget.initialTitle;
+    if (widget.restoreParentPaneStack != null) {
+      widget.restoreParentPaneStack!();
+      stackNotifier.push(
+        topicId: widget.topicId,
+        initialTitle: title,
+        scrollToPostNumber: currentPostNumber,
+        instanceId: _instanceId,
+      );
+      return;
+    }
+    if (widget.restoreExistingPaneStack) {
+      stackNotifier.updateTopTopic(
+        topicId: widget.topicId,
+        initialTitle: title,
+        scrollToPostNumber: currentPostNumber,
+        instanceId: _instanceId,
+      );
+    } else {
+      stackNotifier.select(
+        topicId: widget.topicId,
+        initialTitle: title,
+        scrollToPostNumber: currentPostNumber,
+        instanceId: _instanceId,
+      );
+    }
+  }
+
+  void _restoreCurrentPaneToMasterDetail() {
+    if (!mounted) return;
+    final route = ModalRoute.of(context);
+    if (route == null || !route.isActive) return;
+    final navigator = Navigator.of(context);
+
+    final stackProvider = widget.stackProvider ?? selectedTopicProvider;
+    final stackNotifier = ref.read(stackProvider.notifier);
+    _syncTopicToPaneStack(stackNotifier);
+
+    // 当前路由上方可能还有资料页，不能 pop；精确移除本话题路由。
+    if (route.isActive) navigator.removeRoute(route);
+  }
+
   Future<void> _handleExternalScrollTargetUpdate(int postNumber) async {
+    // 树形视图下不走平铺跳转,切到 context 定位视图
+    if (_isNestedView && postNumber > 1) {
+      setState(() => _nestedTargetPostNumber = postNumber);
+      return;
+    }
     final detail = ref.read(topicDetailProvider(_params)).value;
     final notifier = ref.read(topicDetailProvider(_params).notifier);
     if (detail == null) {
@@ -884,12 +1055,7 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
         actions: [
           IconButton(
             icon: const Icon(Symbols.close_rounded),
-            onPressed: () {
-              _searchController.clear();
-              ref
-                  .read(topicSearchProvider(widget.topicId).notifier)
-                  .exitSearchMode();
-            },
+            onPressed: _exitSearchMode,
           ),
         ],
       );
@@ -922,6 +1088,13 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
 
               return AppBar(
                 automaticallyImplyLeading: !widget.embeddedMode,
+                // 平行视界导航栈：embeddedMode 下默认不显示返回按钮（双栏
+                // 选中态没有"返回"概念），但栈深度 > 1（内部链接跳转堆上来
+                // 的层）时，onEmbeddedBack 会被显式传入，这里补一个返回按钮
+                // 弹出当前层，退回上一层。
+                leading: widget.embeddedMode && widget.onEmbeddedBack != null
+                    ? BackButton(onPressed: widget.onEmbeddedBack)
+                    : null,
                 elevation: currentElevation,
                 scrolledUnderElevation: currentElevation,
                 shadowColor: Colors.transparent,
@@ -1000,7 +1173,11 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
                   alignment: PlaceholderAlignment.middle,
                   child: Padding(
                     padding: const EdgeInsets.only(right: 4),
-                    child: Icon(Symbols.check_box_rounded, size: 18, color: Colors.green),
+                    child: Icon(
+                      Symbols.check_box_rounded,
+                      size: 18,
+                      color: Colors.green,
+                    ),
                   ),
                 ),
               ...EmojiText.buildEmojiSpans(
@@ -1112,7 +1289,11 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
                 alignment: PlaceholderAlignment.middle,
                 child: Padding(
                   padding: const EdgeInsets.only(right: 4),
-                  child: Icon(Symbols.check_box_rounded, size: 16, color: Colors.green),
+                  child: Icon(
+                    Symbols.check_box_rounded,
+                    size: 16,
+                    color: Colors.green,
+                  ),
                 ),
               ),
             ...EmojiText.buildEmojiSpans(
@@ -1196,8 +1377,15 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
     final isInReadLater = ref
         .read(readLaterProvider.notifier)
         .contains(widget.topicId);
+    // 指定入口双闸:assign_enabled 是插件总开关(未装插件时该键不存在),
+    // can_assign 是当前用户权限——只看后者的话,没权限的人点了直接吃
+    // 服务端 403;只看前者的话,普通用户会看到自己用不了的入口。
+    final canAssignTopic =
+        PreloadedDataService().assignEnabled &&
+        (ref.read(currentUserProvider).value?.canAssign ?? false);
     final hasFilter =
         notifier.isSummaryMode ||
+        notifier.isActivityMode ||
         notifier.isAuthorOnlyMode ||
         notifier.isTopLevelMode ||
         _isNestedView;
@@ -1299,6 +1487,20 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
             label: context.l10n.topicDetail_filter,
             iconColor: hasFilter ? Theme.of(context).colorScheme.primary : null,
             children: [
+              // 问答话题:默认按票排序,可切按活动(时间流)
+              if (detail.isPostVoting)
+                MenuQuickActionSubmenuChild(
+                  icon: Symbols.history_rounded,
+                  label: context.l10n.topicDetail_sortByActivity,
+                  selected: notifier.isActivityMode,
+                  onTap: () {
+                    if (notifier.isActivityMode) {
+                      _handleCancelFilter();
+                    } else {
+                      _handleShowByActivity();
+                    }
+                  },
+                ),
               if (detail.hasSummary)
                 MenuQuickActionSubmenuChild(
                   icon: notifier.isSummaryMode
@@ -1374,6 +1576,17 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
           }
           return;
         }
+        if (value == 'assign') {
+          // 弹菜单本身的关闭动画(PopupMenuButton onSelected 触发时它还没
+          // 收完)跟紧接着开的新 modal route 同一帧抢 GPU 合成——聊天那边
+          // 悬浮面板同款场景(_runPanelAction)踩过一次原生层崩溃,靠隔一
+          // 个 tick 再开新 UI 避开两段转场重叠,这里抄同样的套路。
+          Future<void>.delayed(Duration.zero, () {
+            if (!mounted) return;
+            unawaited(showAssignSheet(context, ref, topicId: widget.topicId));
+          });
+          return;
+        }
         final bookmarkTraceTarget = value == 'bookmark'
             ? _bookmarkEditTarget(detail)
             : null;
@@ -1410,6 +1623,9 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
           ),
           onReadLater: _handleReadLater,
           onSubscribe: doSubscribe,
+          onMarkUnread: () => unawaited(_handleMarkUnread(detail)),
+          onMarkUnreadAll: () =>
+              unawaited(_handleMarkUnread(detail, all: true)),
           onShareLink: _shareTopic,
           onShareImage: _shareAsImage,
           onExport: _showExportSheet,
@@ -1486,6 +1702,47 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
             ],
           ),
         ),
+        if (canAssignTopic)
+          PopupMenuItem(
+            value: 'assign',
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.assignment_ind_outlined,
+                  size: 20,
+                  color: detail.isAssigned
+                      ? Theme.of(context).colorScheme.primary
+                      : Theme.of(context).colorScheme.onSurface,
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  detail.isAssigned
+                      ? '已指定 · ${detail.assignedToUser?.displayName ?? detail.assignedToGroupName ?? ''}'
+                      : '指定',
+                ),
+              ],
+            ),
+          ),
+        if (ref.read(currentUserProvider).value != null)
+          ExpandablePopupMenuEntry<String>(
+            icon: Symbols.mark_email_unread_rounded,
+            label: context.l10n.topicDetail_markUnread,
+            children: [
+              ExpandableMenuChild(
+                value: 'mark_unread',
+                icon: Symbols.remove_done_rounded,
+                label: context.l10n.topicDetail_markUnreadLast,
+                subtitle: context.l10n.topicDetail_markUnreadLastDesc,
+              ),
+              ExpandableMenuChild(
+                value: 'mark_unread_all',
+                icon: Symbols.restart_alt_rounded,
+                label: context.l10n.topicDetail_markUnreadAll,
+                subtitle: context.l10n.topicDetail_markUnreadAllDesc,
+              ),
+            ],
+          ),
         const PopupMenuDivider(),
         PopupMenuItem(
           value: 'reading_settings',
@@ -1544,8 +1801,10 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
       isLoggedIn: isLoggedIn,
       totalCount: detail.postStream.stream.length,
       hasSummary: detail.hasSummary,
+      isPostVoting: detail.isPostVoting,
       isPrivateMessage: detail.isPrivateMessage,
       isSummaryMode: notifier.isSummaryMode,
+      isActivityMode: notifier.isActivityMode,
       isAuthorOnlyMode: notifier.isAuthorOnlyMode,
       isTopLevelMode: notifier.isTopLevelMode,
       isNestedMode: _isNestedView,
@@ -1570,11 +1829,13 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
       onProgressTap: _showTimelineSheetForCurrent,
       onProgressGesture: _handleProgressGestureForCurrent,
       isSummaryMode: notifier.isSummaryMode,
+      isActivityMode: notifier.isActivityMode,
       isAuthorOnlyMode: notifier.isAuthorOnlyMode,
       isTopLevelMode: notifier.isTopLevelMode,
       isNestedMode: _isNestedView,
       isLoading: _isSwitchingMode,
       onShowTopReplies: _handleShowTopReplies,
+      onShowByActivity: _handleShowByActivity,
       onShowAuthorOnly: _handleShowAuthorOnly,
       onShowTopLevelReplies: _handleShowTopLevelReplies,
       onCancelFilter: _handleCancelFilter,
@@ -1707,63 +1968,76 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
     _maybeSwitchToMasterDetail(canShowDetailPane);
 
     // 监听 MessageBus 事件
+    //
+    // 平行视界：压栈/退栈会把话题面板从 detail 槽移到 master 槽（或反过
+    // 来），这两个槽位是 widget 树里不同分支，没法用 GlobalKey 跨槽复用
+    // （试过，会命中 Flutter 框架级 GlobalKey 断言崩溃，已回退——见
+    // topics_screen.dart `_keyForTopic` 的注释），所以每次挪槽本面板都
+    // 会被销毁重建。如果这个窗口期正好撞上一条实时推送到达，下面这些
+    // ref.read 可能作用在已失效的 widget 上而报错（表现为点头像/内部
+    // 链接后卡死不响应——实测复现过）。整个回调包一层 try-catch：面板
+    // 反正要没了，跳过这次更新是安全的，比让异常直接把交互链路搅死强。
     ref.listen(topicChannelProvider(widget.topicId), (previous, next) {
       if (!context.mounted) return;
-      // 1. reload_topic（话题状态变更：关闭/打开/固定等）
-      if (next.reloadRequested && !(previous?.reloadRequested ?? false)) {
-        ref
-            .read(topicChannelProvider(widget.topicId).notifier)
-            .clearReloadRequest();
-        _handleReloadTopic(notifier, next.refreshStreamRequested);
-        return;
-      }
-
-      // 2. notification_level_change（通知级别变更）
-      if (next.notificationLevelChange != null &&
-          previous?.notificationLevelChange != next.notificationLevelChange) {
-        final level = TopicNotificationLevel.fromValue(
-          next.notificationLevelChange!,
-        );
-        ref
-            .read(topicChannelProvider(widget.topicId).notifier)
-            .clearNotificationLevelChange();
-        notifier.updateNotificationLevelLocally(level);
-        return;
-      }
-
-      // 3. stats 更新
-      if (next.statsUpdate != null &&
-          previous?.statsUpdate != next.statsUpdate) {
-        notifier.applyStatsUpdate(next.statsUpdate!);
-        ref
-            .read(topicChannelProvider(widget.topicId).notifier)
-            .clearStatsUpdate();
-      }
-
-      // 3.1 "俺也一样" (shared_issue) 计数更新
-      //   - 服务端广播包含 `count` 与 *操作用户的* userCreated
-      //   - 接收端只接受 count；userCreated 不能覆写本地状态(因为对所有订阅者一致)
-      //   - 自己点击的 toggle 响应已直接写入 detail,所以即便回声也只是同值刷新,幂等
-      if (next.sharedIssueUpdate != null &&
-          previous?.sharedIssueUpdate != next.sharedIssueUpdate) {
-        final currentDetail = ref.read(topicDetailProvider(params)).value;
-        if (currentDetail != null) {
-          notifier.updateSharedIssue(
-            next.sharedIssueUpdate!.count,
-            currentDetail.userCreatedSharedIssue,
-          );
+      try {
+        // 1. reload_topic（话题状态变更：关闭/打开/固定等）
+        if (next.reloadRequested && !(previous?.reloadRequested ?? false)) {
+          ref
+              .read(topicChannelProvider(widget.topicId).notifier)
+              .clearReloadRequest();
+          _handleReloadTopic(notifier, next.refreshStreamRequested);
+          return;
         }
-        ref
-            .read(topicChannelProvider(widget.topicId).notifier)
-            .clearSharedIssueUpdate();
-      }
 
-      // 4. 帖子级别更新（created/revised/deleted/liked 等）:
-      // generation 变化 = 新一批(postUpdates 即该批全量,由频道层在
-      // 微任务边界攒批)。批入口统一做去重与积压坍缩。
-      if (next.postUpdatesGeneration !=
-          (previous?.postUpdatesGeneration ?? 0)) {
-        _handlePostUpdateBatch(notifier, next.postUpdates);
+        // 2. notification_level_change（通知级别变更）
+        if (next.notificationLevelChange != null &&
+            previous?.notificationLevelChange != next.notificationLevelChange) {
+          final level = TopicNotificationLevel.fromValue(
+            next.notificationLevelChange!,
+          );
+          ref
+              .read(topicChannelProvider(widget.topicId).notifier)
+              .clearNotificationLevelChange();
+          notifier.updateNotificationLevelLocally(level);
+          return;
+        }
+
+        // 3. stats 更新
+        if (next.statsUpdate != null &&
+            previous?.statsUpdate != next.statsUpdate) {
+          notifier.applyStatsUpdate(next.statsUpdate!);
+          ref
+              .read(topicChannelProvider(widget.topicId).notifier)
+              .clearStatsUpdate();
+        }
+
+        // 3.1 "俺也一样" (shared_issue) 计数更新
+        //   - 服务端广播包含 `count` 与 *操作用户的* userCreated
+        //   - 接收端只接受 count；userCreated 不能覆写本地状态(因为对所有订阅者一致)
+        //   - 自己点击的 toggle 响应已直接写入 detail,所以即便回声也只是同值刷新,幂等
+        if (next.sharedIssueUpdate != null &&
+            previous?.sharedIssueUpdate != next.sharedIssueUpdate) {
+          final currentDetail = ref.read(topicDetailProvider(params)).value;
+          if (currentDetail != null) {
+            notifier.updateSharedIssue(
+              next.sharedIssueUpdate!.count,
+              currentDetail.userCreatedSharedIssue,
+            );
+          }
+          ref
+              .read(topicChannelProvider(widget.topicId).notifier)
+              .clearSharedIssueUpdate();
+        }
+
+        // 4. 帖子级别更新（created/revised/deleted/liked 等）:
+        // generation 变化 = 新一批(postUpdates 即该批全量,由频道层在
+        // 微任务边界攒批)。批入口统一做去重与积压坍缩。
+        if (next.postUpdatesGeneration !=
+            (previous?.postUpdatesGeneration ?? 0)) {
+          _handlePostUpdateBatch(notifier, next.postUpdates);
+        }
+      } catch (_) {
+        // 面板销毁重建窗口期撞上推送，跳过这次更新。
       }
     });
 
@@ -1772,10 +2046,20 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
       if (!context.mounted) return;
       final detail = next.value;
       // 记录话题标题到会话状态，供用户卡片「基于话题的私信」预填标题
+      //
+      // 平行视界下这个话题面板可能在 listener 触发的同一拍被压栈顶替
+      // （比如刚点了头像跳资料，本面板从 detail 槽移到 master 槽，
+      // key 变化导致 Element 被销毁重建）——`context.mounted` 检查和
+      // 这次 provider 读取之间存在极短窗口，命中过
+      // "Looking up a deactivated widget's ancestor is unsafe"（见
+      // app_log.jsonl）。这里只是写会话态标题，面板都要没了就跳过，
+      // 用 try-catch 兜底避免这条竞态崩掉整个交互。
       if (detail != null) {
-        ref
-            .read(topicSessionProvider(widget.topicId).notifier)
-            .setTopicTitle(detail.title);
+        try {
+          ref
+              .read(topicSessionProvider(widget.topicId).notifier)
+              .setTopicTitle(detail.title);
+        } catch (_) {}
       }
       // 首次拿到 detail 后再决定是否应用默认嵌套视图：
       // 私信场景下树形视图 API 拉不到数据，跳过该配置
@@ -1783,11 +2067,32 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
         _defaultNestedViewApplied = true;
         if (!detail.isPrivateMessage &&
             ref.read(preferencesProvider).defaultNestedView) {
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted) {
-              setState(() => _isNestedView = true);
-            }
-          });
+          // 预检:一楼被软删时树形接口必 500(服务端 op_post 未处理
+          // default_scope 过滤),已知场景直接跳过,省一次注定失败的请求。
+          // 只有从头加载(无目标楼层)时平铺流的首帖缺失/被删才是可靠信号;
+          // 带楼层进入时流从中间开始,一楼不在首块属正常。
+          final target = widget.scrollToPostNumber;
+          final fromTop = target == null || target <= 1;
+          final streamPosts = detail.postStream.posts;
+          final opMissingOrDeleted =
+              fromTop &&
+              streamPosts.isNotEmpty &&
+              (streamPosts.first.postNumber != 1 ||
+                  streamPosts.first.isDeleted);
+          if (!opMissingOrDeleted) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) {
+                setState(() {
+                  _isNestedView = true;
+                  _nestedAutoEnabled = true;
+                  // 通知等带楼层进入:树形下走 context 定位视图
+                  _nestedTargetPostNumber = (target != null && target > 1)
+                      ? target
+                      : null;
+                });
+              }
+            });
+          }
         }
       }
       // 与 _buildPostListContent 一致，用过滤后列表判断 1 楼是否存在
@@ -1803,6 +2108,12 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
               _scheduleCheckTitleVisibility();
             }
           });
+        } else if (!hasFirstPost) {
+          // 中途楼层进入(第一页未加载):_hasFirstPost false→false 不触发
+          // 上面的分支,但首帧内容已压在 AppBar 下,需要主动跑一次检查
+          // 让 scrolled-under 态就位(检查内部有 ctx==null + !_hasFirstPost
+          // 的兜底判定)
+          _scheduleCheckTitleVisibility();
         }
 
         // 自动打开回复框（从草稿进入时）
@@ -1810,6 +2121,8 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
           _autoOpenReplyHandled = true;
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted) {
+              // 先从状态源头清掉意图,再弹框:清晚了这一帧的重建又会命中
+              widget.onAutoReplyConsumed?.call();
               // 如果指定了回复帖子编号，找到对应的帖子
               Post? replyToPost;
               if (widget.autoReplyToPostNumber != null) {
@@ -1930,25 +2243,30 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
     );
 
     // 无 AI 模型或非滑动入口模式：普通布局
+    //
+    // 平行视界：这是绝大多数话题（尤其私信——基本不会挂 AI 模型）走的
+    // 分支，之前 EmbeddedStackScope 只包在下面"AI 滑动入口"那条分支里，
+    // 导致常规话题/私信内部链接点击永远找不到嵌入面板、一直全屏 push
+    // （实测确认：私信打开话题分栏正常，但点内部链接 EmbeddedStackScope
+    // 始终为 null——根因就是这条分支从没被 EmbeddedStackScope 包过）。
     if (!hasAiModel || !useSwipeEntry) {
-      return LazyLoadScope(
-        child: PopScope(
-          canPop: !isSearchMode,
-          onPopInvokedWithResult: (bool didPop, dynamic result) {
-            if (!didPop) {
-              _searchController.clear();
-              ref
-                  .read(topicSearchProvider(widget.topicId).notifier)
-                  .exitSearchMode();
-            }
-          },
-          child: topicScaffold,
+      return _wrapEmbeddedStack(
+        LazyLoadScope(
+          child: PopScope(
+            canPop: !isSearchMode,
+            onPopInvokedWithResult: (bool didPop, dynamic result) {
+              if (!didPop) {
+                _exitSearchMode();
+              }
+            },
+            child: topicScaffold,
+          ),
         ),
       );
     }
 
     // 滑动入口模式：PageView 包裹话题详情和 AI 聊天
-    return LazyLoadScope(
+    final pageViewScope = LazyLoadScope(
       child: ValueListenableBuilder<int>(
         valueListenable: _currentPageNotifier,
         builder: (context, currentPage, _) {
@@ -1958,16 +2276,9 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
             onPopInvokedWithResult: (bool didPop, dynamic result) {
               if (!didPop) {
                 if (isOnAiPage) {
-                  _pageController.animateToPage(
-                    0,
-                    duration: const Duration(milliseconds: 300),
-                    curve: Curves.easeOutCubic,
-                  );
+                  _returnFromAiPage();
                 } else {
-                  _searchController.clear();
-                  ref
-                      .read(topicSearchProvider(widget.topicId).notifier)
-                      .exitSearchMode();
+                  _exitSearchMode();
                 }
               }
             },
@@ -1994,6 +2305,7 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
                         topicId: widget.topicId,
                         detail: detail,
                         embedded: true,
+                        onEscape: _returnFromAiPage,
                         onReplyToTopic: detail == null
                             ? null
                             : (imageMarkdown) {
@@ -2024,6 +2336,37 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
         },
       ),
     );
+
+    return _wrapEmbeddedStack(pageViewScope);
+  }
+
+  /// 平行视界导航栈：内部链接点击时该压到哪个栈（首页话题栈还是私信栈
+  /// 等），用 InheritedWidget 按实际 widget 树最近祖先解析，而不是全局
+  /// 可变状态——IndexedStack 里首页跟私信的嵌入面板可能同时挂载，全局
+  /// "当前活跃面板"标记会被互相踩掉（这是更早一版的 bug）。
+  ///
+  /// 两条 return 分支（AI 滑动入口 / 普通布局）都要包——之前只包了
+  /// "AI 滑动入口"那条分支，绝大多数话题（尤其私信，基本不会挂 AI
+  /// 模型）走的是普通布局分支，从没被包过，导致这些话题内部链接点击
+  /// 永远找不到 EmbeddedStackScope、一直全屏 push（实测确认：日志显示
+  /// 分栏本身没问题，但链接点击时 stackProvider 始终为 null——根因就是
+  /// 这个分支漏包）。
+  Widget _wrapEmbeddedStack(Widget child) {
+    if (widget.embeddedMode) {
+      return EmbeddedStackScope(
+        stackProvider: widget.stackProvider ?? selectedTopicProvider,
+        truncateOnPush: widget.truncateOnPush,
+        child: child,
+      );
+    }
+    if (widget.autoSwitchToMasterDetail) {
+      return FullScreenPaneRestoreScope(
+        stackProvider: widget.stackProvider ?? selectedTopicProvider,
+        restoreCurrentPane: _restoreCurrentPaneToMasterDetail,
+        child: child,
+      );
+    }
+    return child;
   }
 
   void _showAiAssistantSheet(TopicDetail detail) {
@@ -2134,7 +2477,7 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
 
     // Stack 组装
     return Stack(
-      children: [
+        children: [
         // 使用 Offstage 保持帖子列表存在但在搜索模式下隐藏，保留滚动位置
         Offstage(offstage: isSearchMode, child: content),
 
@@ -2221,7 +2564,7 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
               );
             },
           ),
-      ],
+        ],
     );
   }
 
@@ -2231,7 +2574,9 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
   /// postIndex 数学，riverpod 状态实例与名单实例都未变时直接复用上次
   /// 结果，避免每次 read 都重新过滤。
   TopicDetail _filteredDetail(TopicDetail detail) {
-    final blocked = ref.read(preferencesProvider).normalizedBlockedUsernames;
+    final blocked = _providerContainer
+        .read(preferencesProvider)
+        .normalizedBlockedUsernames;
     if (identical(_blockedFilterInput, detail) &&
         identical(_blockedFilterBlocked, blocked)) {
       return _blockedFilterOutput!;
@@ -2322,16 +2667,41 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
 
     // 嵌套视图模式
     if (_isNestedView) {
-      final nestedParams = NestedTopicParams(topicId: widget.topicId);
+      final nestedParams = NestedTopicParams(
+        topicId: widget.topicId,
+        targetPostNumber: _nestedTargetPostNumber,
+      );
       final nestedAsync = ref.watch(nestedTopicProvider(nestedParams));
+
+      // 默认配置自动开启的树形加载失败(如一楼被删的 500):静默回落平铺,
+      // 平铺流本来就在底下加载着,scrollToPostNumber 定位链路自然接管。
+      // 手动切换失败仍显示错误页可重试。
+      if (nestedAsync.hasError && _nestedAutoEnabled) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || !_isNestedView || !_nestedAutoEnabled) return;
+          setState(() {
+            _isNestedView = false;
+            _nestedTargetPostNumber = null;
+          });
+          _scheduleCheckTitleVisibility();
+          if (!_nestedFallbackNotified) {
+            _nestedFallbackNotified = true;
+            ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+              SnackBar(content: Text(context.l10n.nested_fallbackToFlat)),
+            );
+          }
+        });
+      }
 
       Widget nestedView = nestedAsync.when(
         loading: () => PostListSkeleton(withHeader: true),
-        error: (e, s) => ErrorView(
-          error: e,
-          stackTrace: s,
-          onRetry: () => ref.invalidate(nestedTopicProvider(nestedParams)),
-        ),
+        error: (e, s) => _nestedAutoEnabled
+            ? PostListSkeleton(withHeader: true)
+            : ErrorView(
+                error: e,
+                stackTrace: s,
+                onRetry: () => ref.invalidate(nestedTopicProvider(nestedParams)),
+              ),
         data: (nestedState) => NestedPostList(
           nestedState: nestedState,
           params: nestedParams,
@@ -2351,8 +2721,14 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
           onNotificationLevelChanged: (level) =>
               _handleNotificationLevelChanged(notifier, level),
           onSolutionChanged: _handleSolutionChanged,
+          onQuoteSelection: isLoggedIn ? _handleQuoteSelection : null,
           onScrollNotification: _controller.handleScrollNotification,
           onVisiblePostsChanged: _updateVisiblePosts,
+          onViewFullTopic: _nestedTargetPostNumber != null
+              ? () => setState(() => _nestedTargetPostNumber = null)
+              : null,
+          onViewParentContext: (postNumber) =>
+              setState(() => _nestedTargetPostNumber = postNumber),
         ),
       );
 
@@ -2374,10 +2750,17 @@ class _TopicDetailPageState extends ConsumerState<TopicDetailPage>
               viewportAnchor: _viewportAnchor,
               headerKey: _headerKey,
               hideHeaderTitle: widget.hideInlineHeaderTitle,
+              canAssignPost:
+                  PreloadedDataService().assignEnabled &&
+                  (ref.read(currentUserProvider).value?.canAssign ?? false),
               selectedPostNumber: selectedPostNumber,
               highlightPostNumber: highlightPostNumber,
               highlightBoostUsername: widget.highlightBoostUsername,
               isLoggedIn: isLoggedIn,
+              isActivitySort: notifier.isActivityMode,
+              onAnswerSortChanged: (byActivity) => byActivity
+                  ? _handleShowByActivity()
+                  : _handleCancelFilter(),
               hasMoreBefore: notifier.hasMoreBefore,
               hasMoreAfter: notifier.hasMoreAfter,
               loadingPreviousListenable: notifier.loadingPreviousListenable,

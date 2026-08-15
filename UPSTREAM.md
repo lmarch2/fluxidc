@@ -4,12 +4,12 @@ FluxIDC is a modified distribution of [Lingyan000/fluxdo](https://github.com/Lin
 
 ## Imported baseline
 
-- FluxDO commit: `5cfa2e3813ebe2c5feebc9a0d09814bb4ef18a0b`
-- FluxDO release line: `v0.2.25`
+- FluxDO commit: `dc4e9798400bf915d1ec9120d8aca66a3abc8c47`
+- FluxDO release line: `v0.2.26`
 - `core/doh_proxy`: `08d3468f0a1eb2858840c525d61f8aa888696522`
-- `packages/fluxdo_render`: `6a0f26c6ea7f5978f2bb2a3b94f5b3736f1fb238`
+- `packages/fluxdo_render`: `59eb891459fdd61b1d2c318b4b0e6fcd180ef9ea`
 
-The upstream Git metadata was not copied into this project tree. The two upstream submodule source trees were imported with the application source so a checkout remains buildable without nested Git repositories.
+The upstream remote and merge history are retained. The two upstream source trees remain Git submodules, so source checkouts must initialize submodules before bootstrapping the Flutter workspace.
 
 ## FluxIDC changes
 

@@ -34,6 +34,8 @@ class SettingsRenderer extends ConsumerWidget {
     ThemeData theme,
     SwitchModel m,
   ) {
+    // 依赖的前置开关关闭时整行隐藏(展示无意义;前置开启当场出现)
+    if (!(m.enabledWhen?.call(ref) ?? true)) return const SizedBox.shrink();
     final value = m.getValue(ref);
     return SwitchListTile(
       title: Text(m.title),

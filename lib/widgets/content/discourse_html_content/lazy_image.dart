@@ -65,6 +65,13 @@ class LazyImage extends StatefulWidget {
   /// 语义 —— web 端加载中就是此纯色背景)。null = 默认灰底。
   final Color? placeholderColor;
 
+  /// 网格瓦片来源:Hero 飞行体换 cover↔contain 裁切插值
+  /// (透传给 HeroImage,见 CoverContainFlightImage)
+  final bool coverFlight;
+
+  /// 瓦片圆角(飞行中插值到 0)
+  final double flightRadius;
+
   const LazyImage({
     super.key,
     required this.imageProvider,
@@ -78,6 +85,8 @@ class LazyImage extends StatefulWidget {
     this.cacheKey,
     this.decodeWidth,
     this.placeholderColor,
+    this.coverFlight = false,
+    this.flightRadius = 0,
   });
 
   @override
@@ -393,6 +402,9 @@ class _LazyImageState extends State<LazyImage> {
       onTap: widget.onTap,
       onLongPress: widget.onLongPress,
       onSecondaryTapUp: widget.onSecondaryTapUp,
+      coverFlight: widget.coverFlight,
+      flightImage: widget.coverFlight ? _buildProvider(context) : null,
+      flightRadius: widget.flightRadius,
       child: imageChild,
     );
 

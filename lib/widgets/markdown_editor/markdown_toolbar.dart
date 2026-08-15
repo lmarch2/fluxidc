@@ -1,6 +1,10 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:fluxdo_render/editor.dart' show
+        observeModifierKeyEvent,
+        primaryModifierHeldForReversibleAction,
+        shiftModifierHeld;
 import 'package:flutter/material.dart';
 import 'package:app_icons/app_icons.dart';
 import 'package:flutter/services.dart';
@@ -25,6 +29,7 @@ import 'media_upload_helper.dart';
 import 'voice_recorder_sheet.dart';
 import 'image_upload_dialog.dart';
 import 'link_insert_dialog.dart';
+import 'poll_builder_dialog.dart';
 import 'template_insert_dialog.dart';
 import 'package:common_ui/common_ui.dart';
 import '../../../../../l10n/s.dart';
@@ -120,13 +125,21 @@ class MarkdownToolbarState extends State<MarkdownToolbar> {
 
   /// 全局键盘事件处理，检测 Cmd+V / Ctrl+V 粘贴图片
   bool _handleRawKeyEvent(KeyEvent event) {
+    // 先喂内核的修饰键跟踪:焦点在源码编辑器(普通 TextField)时内核的
+    // handleEditorKeyEvent 收不到按键,本地 Shift 跟踪会冻结 ——
+    // shiftModifierHeld 是合取语义(HardwareKeyboard 且 本地跟踪),不喂
+    // 就恒 false,Ctrl+Shift+V 会被误判成 Ctrl+V 触发贴图。
+    observeModifierKeyEvent(event);
     if (widget.focusNode == null || !widget.focusNode!.hasFocus) return false;
+    // 贴图是**可逆**动作 → 用宽松版判定(真实状态 或 2s 补偿窗口):
+    // Win+V 注入的 V 不带 Ctrl 修饰位,只认真实状态整条贴图路径失效。
+    // Shift 用内核合取判定防 Windows 中文输入法切换导致的假按住,
+    // Alt 无失真先例保持直读。
     if (event is KeyDownEvent &&
         event.logicalKey == LogicalKeyboardKey.keyV &&
-        !HardwareKeyboard.instance.isShiftPressed &&
+        !shiftModifierHeld() &&
         !HardwareKeyboard.instance.isAltPressed &&
-        (HardwareKeyboard.instance.isMetaPressed ||
-            HardwareKeyboard.instance.isControlPressed)) {
+        primaryModifierHeldForReversibleAction(event)) {
       _handlePasteImage();
       // 不返回 true：让 TextField 自行处理文本粘贴，
       // 仅在检测到图片时通过上传流程处理
@@ -955,6 +968,19 @@ class MarkdownToolbarState extends State<MarkdownToolbar> {
         text[selection.start - 1] != '\n';
     final prefix = needsLeadingNewline ? '\n' : '';
     insertText('$prefix$snippet\n');
+  }
+
+  /// 插入投票:构建对话框 → [poll] BBCode 块级插入。同帖多投票时
+  /// name 必须唯一,按现有文本统计 poll 数决定 name=pollN。
+  Future<void> insertPoll(BuildContext context) async {
+    final existing =
+        RegExp(r'\[poll[\s\]]').allMatches(widget.controller.text).length;
+    final spec = await showPollBuilderDialog(
+      context,
+      existingPollCount: existing,
+    );
+    if (spec == null || !mounted) return;
+    insertBlockSnippet(spec.toBBCode(existingPollCount: existing));
   }
 
   /// 语音消息:录音面板 → 上传([wrap=voice] 语音条标签)→ 插入。

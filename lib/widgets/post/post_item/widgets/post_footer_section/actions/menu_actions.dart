@@ -106,6 +106,23 @@ extension _PostFooterMenuActions on _PostFooterSectionState {
                     widget.onEdit!();
                   },
                 ),
+              // 菜单点击后才构建，用 read 避免给楼层常驻树增加监听。
+              if (ref.read(preferencesProvider).aiTranslationEnabled &&
+                  ref.read(aiTranslationSelectedModelProvider) != null)
+                ListTile(
+                  leading: Icon(
+                    Symbols.translate_rounded,
+                    color: theme.colorScheme.onSurface,
+                  ),
+                  title: Text(context.l10n.ai_translationMenuLabel),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    showAiTranslationSheet(
+                      context,
+                      cookedHtml: widget.post.cooked,
+                    );
+                  },
+                ),
               ListTile(
                 leading: Icon(
                   Symbols.share_rounded,
@@ -231,6 +248,18 @@ extension _PostFooterMenuActions on _PostFooterSectionState {
                     } else {
                       _addBookmark();
                     }
+                  },
+                ),
+              if (widget.canAssignPost && widget.onAssignPost != null)
+                ListTile(
+                  leading: Icon(
+                    Icons.assignment_ind_outlined,
+                    color: theme.colorScheme.onSurface,
+                  ),
+                  title: const Text('指定帖子'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    widget.onAssignPost!();
                   },
                 ),
               if (!isGuest)

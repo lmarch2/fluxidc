@@ -204,7 +204,7 @@ class _GestureImageViewState extends State<GestureImageView>
     if (identical(info, _mainInfo)) {
       return;
     }
-    _mainInfo?.dispose();
+    _retireInfo(_mainInfo);
     _mainInfo = info;
   }
 
@@ -212,8 +212,53 @@ class _GestureImageViewState extends State<GestureImageView>
     if (identical(info, _placeholderInfo)) {
       return;
     }
-    _placeholderInfo?.dispose();
+    _retireInfo(_placeholderInfo);
     _placeholderInfo = info;
+  }
+
+  /// 已建 widget 中仍被引用的退役帧(动图逐帧替换时产生)
+  final List<ImageInfo> _retiredInfos = [];
+  bool _retireFlushScheduled = false;
+
+  /// 延迟两帧再 dispose 被替换的 ImageInfo:widget 配置里传的是裸
+  /// ui.Image 句柄,Hero 飞行 shuttle 捕获的旧 widget 树可能晚一两帧
+  /// 才挂载(createRenderObject 时 clone)—— 立即 dispose 会在动图
+  /// (逐帧替换)+ 开合飞行的组合下命中 "Cannot clone a disposed
+  /// image"。挂载后 RenderObject 持有自己的 clone,不受影响。
+  void _retireInfo(ImageInfo? info) {
+    if (info == null) {
+      return;
+    }
+    _retiredInfos.add(info);
+    _scheduleRetireFlush();
+  }
+
+  void _scheduleRetireFlush() {
+    if (_retireFlushScheduled || _retiredInfos.isEmpty) {
+      return;
+    }
+    _retireFlushScheduled = true;
+    // 两级 post-frame = 至少隔一整帧
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      SchedulerBinding.instance.addPostFrameCallback((_) {
+        _retireFlushScheduled = false;
+        if (!mounted) {
+          // dispose 已清场,这里只兜底
+          for (final info in _retiredInfos) {
+            info.dispose();
+          }
+          _retiredInfos.clear();
+          return;
+        }
+        for (final info in _retiredInfos) {
+          info.dispose();
+        }
+        _retiredInfos.clear();
+        // 窗口期内又有新退役帧入列则续排
+        _scheduleRetireFlush();
+      });
+      // 期间可能有新帧入列,由外层标志防重复排程
+    });
   }
 
   void _detachMainStream() {
@@ -236,8 +281,14 @@ class _GestureImageViewState extends State<GestureImageView>
   void dispose() {
     _detachMainStream();
     _detachPlaceholderStream();
-    _replaceMainInfo(null);
-    _replacePlaceholderInfo(null);
+    _mainInfo?.dispose();
+    _mainInfo = null;
+    _placeholderInfo?.dispose();
+    _placeholderInfo = null;
+    for (final info in _retiredInfos) {
+      info.dispose();
+    }
+    _retiredInfos.clear();
     _fadeController.dispose();
     super.dispose();
   }

@@ -8,6 +8,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:m3e_ui/m3e_ui.dart';
 import '../utils/frame_jank_monitor.dart';
 import '../utils/link_launcher.dart';
+import '../services/deep_link_service.dart';
 import '../services/toast_service.dart';
 import '../services/app_link_service.dart';
 import '../services/network/cookie/cookie_store_observer.dart';
@@ -58,6 +59,8 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
   double _progress = 0;
   bool _canGoBack = false;
   bool _canGoForward = false;
+  bool _historyStateSettled = false;
+  int _navigationRevision = 0;
 
   /// 对话框期间用静态截图盖住 WebView，避免 BackdropFilter 对
   /// hybrid composition（Android）/HWND（Windows）实时回读造成卡顿。
@@ -94,7 +97,11 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
     );
 
     return PopScope(
-      canPop: false,
+      // WebView 还有历史时，返回键先回退网页；到首层后交给路由，
+      // 这样离开浏览器页面可以使用 Android 预测式返回动画。
+      // 历史状态未稳定时保守拦截并实时查询，避免新页面刚开始导航、
+      // _canGoBack 尚未回填的窗口里把整个 WebView 路由直接退出。
+      canPop: _historyStateSettled && !_canGoBack,
       onPopInvokedWithResult: (didPop, result) async {
         if (didPop) return;
         await _handleBackNavigation();
@@ -275,6 +282,8 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
                             },
                             onLoadStart: (controller, url) {
                               setState(() {
+                                _navigationRevision += 1;
+                                _historyStateSettled = false;
                                 _isLoading = true;
                                 _currentUrl = url?.toString() ?? '';
                               });
@@ -283,6 +292,7 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
                               setState(() => _progress = progress / 100);
                             },
                             onLoadStop: (controller, url) async {
+                              final revision = _navigationRevision;
                               setState(() => _isLoading = false);
                               // 触发 cookie observer sweep (Android 主要触发点;
                               // Apple 平台 native observer 已有覆盖, 此处与 debounce
@@ -293,11 +303,15 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
                               final canGoBack = await controller.canGoBack();
                               final canGoForward =
                                   await controller.canGoForward();
+                              if (!mounted || revision != _navigationRevision) {
+                                return;
+                              }
                               final urlString = url?.toString();
                               setState(() {
                                 _currentUrl = urlString ?? '';
                                 _canGoBack = canGoBack;
                                 _canGoForward = canGoForward;
+                                _historyStateSettled = true;
                                 if (title != null && title.isNotEmpty) {
                                   _currentTitle = title;
                                 }
@@ -316,15 +330,21 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
                             },
                             onUpdateVisitedHistory:
                                 (controller, url, isReload) async {
+                                  final revision = _navigationRevision;
                                   final canGoBack =
                                       await controller.canGoBack();
                                   final canGoForward =
                                       await controller.canGoForward();
+                                  if (!mounted ||
+                                      revision != _navigationRevision) {
+                                    return;
+                                  }
                                   final urlString = url?.toString();
                                   setState(() {
                                     _currentUrl = urlString ?? '';
                                     _canGoBack = canGoBack;
                                     _canGoForward = canGoForward;
+                                    _historyStateSettled = true;
                                   });
                                 },
                             onTitleChanged: (controller, title) {
@@ -388,6 +408,13 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
 
     // javascript: 静默阻止
     if (scheme == 'javascript') {
+      return NavigationActionPolicy.CANCEL;
+    }
+
+    // 应用自有 scheme 直接交给深链服务，避免授权回调被当成外部应用
+    // 链接弹出确认框，或在 WebView 内导航失败。
+    if (scheme == 'fluxdo' || scheme == 'discourse') {
+      DeepLinkService.instance.handleUri(url);
       return NavigationActionPolicy.CANCEL;
     }
 

@@ -7,13 +7,16 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../config/site_customization.dart';
 import '../constants.dart';
+import '../pages/chat/channel/chat_channel_page.dart';
 import '../pages/image_viewer_page.dart';
-import '../pages/user_profile_page.dart';
 import '../pages/webview_page.dart';
 import '../providers/preferences_provider.dart';
+import '../providers/category_provider.dart';
+import '../providers/selected_topic_provider.dart';
 import '../services/discourse/discourse_service.dart';
 import '../widgets/common/external_link_confirm_dialog.dart';
 import '../widgets/content/discourse_html_content/image_utils.dart';
+import '../widgets/layout/home_workspace_scope.dart';
 import 'discourse_url_parser.dart';
 import 'link_security.dart';
 import 'url_helper.dart';
@@ -95,15 +98,16 @@ Future<void> launchExternalLink(BuildContext context, String url) async {
     }
   }
 
+  // 安全确认对话框关闭时，原帖子/页面可能已经被滚动回收或导航销毁。
+  if (!context.mounted) return;
+
   final prefs = ProviderScope.containerOf(
-    // ignore: use_build_context_synchronously
     context,
     listen: false,
   ).read(preferencesProvider);
   final preferInApp = prefs.openExternalLinksInAppBrowser;
 
   if (preferInApp && (uri.scheme == 'http' || uri.scheme == 'https')) {
-    // ignore: use_build_context_synchronously
     WebViewPage.open(context, url);
     return;
   }
@@ -126,28 +130,77 @@ Future<void> launchExternalLink(BuildContext context, String url) async {
 Future<void> launchContentLink(
   BuildContext context,
   String url, {
-  void Function(int topicId, String? topicSlug, int? postNumber)? onInternalLinkTap,
+  void Function(int topicId, String? topicSlug, int? postNumber)?
+  onInternalLinkTap,
   void Function(String url)? onDownloadAttachment,
 }) async {
   if (url.isEmpty) return;
   if (url.startsWith('upload://')) {
     url = await DiscourseService().resolveShortUrlForLink(url) ?? url;
+    // 短链解析期间列表项可能已离开缓存范围并被销毁，不能再使用旧 context。
+    if (!context.mounted) return;
   }
 
   // 1. 识别用户链接 /u/username
   final userInfo = DiscourseUrlParser.parseUser(url);
   if (userInfo != null && isInternalUrlString(url)) {
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => UserProfilePage(username: userInfo.username)),
+    EmbeddedStackScope.openProfile(context, userInfo.username);
+    return;
+  }
+
+  // 首页平行视界中的站点首页、分类和标签链接直接替换左栏，不再打开
+  // WebView。正文链接与话题头部 Badge 使用同一套行为。
+  final workspace = HomeWorkspaceScope.maybeOf(context);
+  if (workspace != null && isInternalUrlString(url)) {
+    if (DiscourseUrlParser.isHomepage(url)) {
+      workspace.onShowFeed();
+      return;
+    }
+    final categoryInfo = DiscourseUrlParser.parseCategory(url);
+    if (categoryInfo != null) {
+      final container = ProviderScope.containerOf(context, listen: false);
+      final category = container
+          .read(categoryMapProvider)
+          .value?[categoryInfo.categoryId];
+      if (category != null) {
+        workspace.onShowCategory(category);
+        return;
+      }
+    }
+    final tag = DiscourseUrlParser.parseTag(url);
+    if (tag != null && tag.isNotEmpty) {
+      workspace.onShowTag(tag);
+      return;
+    }
+  }
+
+  // 2. 聊天链接(/chat/c/...):进原生频道页,消息 id 作定位锚点。
+  //    必须在话题分支之前——thread 形态 /chat/c/-/:cid/t/:tid/:mid 里的
+  //    "/t/数字" 会被话题正则误命中抢走
+  final chatInfo = DiscourseUrlParser.parseChat(url);
+  if (chatInfo != null && isInternalUrlString(url)) {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ChatChannelPage(
+          channelId: chatInfo.channelId,
+          threadId: chatInfo.threadId,
+          initialMessageId: chatInfo.messageId,
+        ),
+      ),
     );
     return;
   }
 
-  // 2. 解析话题链接
+  // 3. 解析话题链接
   final topicInfo = DiscourseUrlParser.parseTopic(url);
   if (topicInfo != null && isInternalUrlString(url)) {
     if (onInternalLinkTap != null) {
-      onInternalLinkTap(topicInfo.topicId, topicInfo.slug, topicInfo.postNumber);
+      onInternalLinkTap(
+        topicInfo.topicId,
+        topicInfo.slug,
+        topicInfo.postNumber,
+      );
       return;
     }
     // 没有回调时用 WebView 打开
@@ -155,6 +208,7 @@ Future<void> launchContentLink(
     WebViewPage.open(context, fullUrl);
     return;
   }
+
 
   // 3. 图片直链(站点自己的域名/CDN/S3 CDN)→ 直接用内置查看器打开,
   //    与网页端一致(点图直接看大图,不当"外部链接"走离站确认弹窗)。
@@ -214,10 +268,9 @@ Future<bool> launchInExternalBrowser(String url) async {
 
   if (Platform.isAndroid) {
     try {
-      final result = await _browserChannel.invokeMethod<bool>(
-        'openInBrowser',
-        {'url': url},
-      );
+      final result = await _browserChannel.invokeMethod<bool>('openInBrowser', {
+        'url': url,
+      });
       return result ?? false;
     } catch (e) {
       debugPrint('[LinkLauncher] Failed to launch browser: $e');

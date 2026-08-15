@@ -11,6 +11,7 @@ import '../pages/settings_page.dart';
 import '../providers/shortcut_provider.dart';
 import '../utils/dialog_utils.dart';
 import '../utils/platform_utils.dart';
+import 'esc_fallback_observer.dart';
 import 'notification/notification_quick_panel.dart';
 import 'shortcut_help_overlay.dart';
 
@@ -56,13 +57,31 @@ class _KeyboardShortcutHandlerState
   bool _handleKeyEvent(KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) return false;
 
-    // 如果焦点在文本输入框中，不拦截（让用户正常打字）
-    if (_isFocusInTextInput()) return false;
-
+    final focusInTextInput = _isFocusInTextInput();
     final bindings = ref.read(shortcutProvider);
 
     for (final binding in bindings) {
       if (!matchKeyEvent(event, binding.activator)) continue;
+      // 文本输入期间仍允许单次 Esc 关闭当前页内状态；其余快捷键继续
+      // 让给输入法，避免 J/K 等可打印字符被全局动作抢走。
+      // IME 组字中（拼音候选未上屏）Esc 的语义是"取消候选"，必须放行
+      // 给输入法，绝不能当 closeOverlay 消费。
+      if (focusInTextInput &&
+          (event is! KeyDownEvent ||
+              event.logicalKey != LogicalKeyboardKey.escape ||
+              binding.action != ShortcutAction.closeOverlay ||
+              _isImeComposingAtFocus())) {
+        continue;
+      }
+
+      // 退层类动作是离散语义,不接受系统 key repeat:按住 Esc(或系统
+      // 重复率调快)时 repeat 以数十毫秒一发连打,配合路由级 ESC 兜底
+      // 会把整条路由栈一口气退光。消费而不放行——放行会漏进焦点管线,
+      // 被 DismissIntent / 页面本地 Esc 处理器重复触发,问题原样复现。
+      // J/K 等导航动作仍照常吃 repeat。
+      if (event is KeyRepeatEvent && _isCloseSurfaceAction(binding.action)) {
+        return true;
+      }
 
       final surfaceDispatch = _handleSurfaceBeforeDispatch(binding.action);
       if (surfaceDispatch == _ShortcutSurfaceDispatch.handled ||
@@ -75,6 +94,18 @@ class _KeyboardShortcutHandlerState
       if (callback != null) {
         callback();
         return true;
+      }
+
+      // 路由级 ESC 兜底:全屏页 push 时由 EscFallbackObserver 自动登记,
+      // 页面无需显式接入即可 ESC 关闭。放在 context 回调之后——显式
+      // 注册(先退页内搜索等定制语义)永远优先;弹层在 surface 层已被
+      // 消费,不会落到这里。maybePop 尊重 PopScope。
+      if (binding.action == ShortcutAction.closeOverlay) {
+        final entry = EscFallbackObserver.resolveCurrent();
+        if (entry != null) {
+          entry.close();
+          return true;
+        }
       }
 
       // 全局动作
@@ -96,6 +127,30 @@ class _KeyboardShortcutHandlerState
     );
     if (topSurface != null) {
       if (_isCloseSurfaceAction(action)) {
+        // 嵌套 Navigator(设置页内栏)里还有子页时,ESC 先退子页——
+        // 否则 surface 的 onClose 会直接关掉整个设置页。
+        final nested = EscFallbackObserver.resolveCurrent();
+        if (nested != null && nested.isNestedInside(currentRoute)) {
+          nested.close();
+          return _ShortcutSurfaceDispatch.handled;
+        }
+        // route 类 surface 就是页面自身:页内 detail 面板注册的
+        // closeOverlay(嵌入话题/资料面板的返回)比「关闭整页」更具体,
+        // 让位给 context 回调分发——否则搜索页开着话题按 Esc 会直接
+        // 关掉整个搜索页。只认 detail scope:context scope 可能是宿主
+        // PaneHostEscBinding 的"关整页"maybePop,让位给它会把嵌入搜索
+        // surface 的定制 onClose(_showFeed)顶掉。panel/overlay 类
+        // surface 浮在页面之上,仍然优先关自己(通知面板盖着话题页时
+        // Esc 必须先关面板)。
+        if (topSurface.kind == ShortcutSurfaceKind.route &&
+            action == ShortcutAction.closeOverlay &&
+            resolveShortcutScopeCallbacks(
+              registry: ref.read(shortcutScopeRegistryProvider),
+              scope: ShortcutScope.detail,
+              route: currentRoute,
+            ).containsKey(action)) {
+          return _ShortcutSurfaceDispatch.pass;
+        }
         _closeSurface(topSurface, fallbackRoute: currentRoute);
         return _ShortcutSurfaceDispatch.handled;
       }
@@ -172,7 +227,7 @@ class _KeyboardShortcutHandlerState
       return singlePane[action];
     }
 
-    // 2. 双栏模式：仅查找活跃面板的回调，不回退到另一面板
+    // 2. 双栏模式：仅查找活跃面板的回调（closeOverlay 的回退例外见下）
     final activePane = ref.read(activePaneProvider);
     final activeCallbacks = resolveShortcutScopeCallbacks(
       registry: registry,
@@ -183,6 +238,23 @@ class _KeyboardShortcutHandlerState
     );
     if (activeCallbacks.containsKey(action)) {
       return activeCallbacks[action];
+    }
+
+    // 3. 例外：closeOverlay 在 master 侧回退到 detail。master 列表只注册
+    //    J/K/Enter 之类导航动作,没有 closeOverlay——焦点在左栏时按 Esc
+    //    落空会显得"失灵",用户直觉是关掉右侧详情。仅 closeOverlay 回退,
+    //    导航动作仍严格按活跃面板分发,不越界。右栏无选中时 detail 无
+    //    注册,回退落空,维持原空操作。
+    if (action == ShortcutAction.closeOverlay &&
+        activePane == ActivePane.master) {
+      final detailCallbacks = resolveShortcutScopeCallbacks(
+        registry: registry,
+        scope: ShortcutScope.detail,
+        route: currentRoute,
+      );
+      if (detailCallbacks.containsKey(action)) {
+        return detailCallbacks[action];
+      }
     }
 
     return null;
@@ -346,6 +418,33 @@ class _KeyboardShortcutHandlerState
   }
 
   /// 检查焦点是否在文本输入框中
+  /// 焦点编辑器是否正处于 IME 组字（候选词未上屏）。
+  ///
+  /// Windows 引擎会把合规 IME 组字期间消费的按键标成 VK_PROCESSKEY 并
+  /// 直接吞掉（engine keyboard_key_embedder_handler.cc），这类 Esc 根本
+  /// 到不了框架层；这里兜的是不合规输入法把组字中的 Esc 原样放行的
+  /// 场景。组字取消后（composing 区间清空）下一次 Esc 才恢复关闭语义。
+  bool _isImeComposingAtFocus() {
+    final focus = FocusManager.instance.primaryFocus;
+    final context = focus?.context;
+    if (context == null) return false;
+    var composing = false;
+    (context as Element).visitAncestorElements((ancestor) {
+      final w = ancestor.widget;
+      if (w is EditableText) {
+        final range = w.controller.value.composing;
+        composing = range.isValid && !range.isCollapsed;
+        return false;
+      }
+      if (w is FluxdoEditor) {
+        composing = w.state.hasComposing;
+        return false;
+      }
+      return true;
+    });
+    return composing;
+  }
+
   bool _isFocusInTextInput() {
     final focus = FocusManager.instance.primaryFocus;
     if (focus?.context == null) return false;

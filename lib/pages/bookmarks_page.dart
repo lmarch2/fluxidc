@@ -12,13 +12,17 @@ import '../pages/bookmarks/bookmarks_models.dart';
 import '../providers/bookmark_name_suggestions_provider.dart';
 import '../providers/discourse_providers.dart';
 import '../providers/preferences_provider.dart';
+import '../providers/bookmark_sync_controller.dart';
 import '../providers/bookmarks_reconciler.dart';
 import '../providers/user_content_providers.dart';
 import '../providers/user_content_search_provider.dart';
+import '../models/shortcut_binding.dart';
+import '../providers/shortcut_provider.dart';
 import '../services/app_error_handler.dart';
 import '../services/discourse/discourse_service.dart';
 import '../services/toast_service.dart';
 import '../utils/dialog_utils.dart';
+import '../utils/link_launcher.dart';
 import '../utils/load_more_coordinator.dart';
 import '../utils/platform_utils.dart';
 import '../widgets/bookmark/bookmark_edit_sheet_launcher.dart';
@@ -62,9 +66,29 @@ class _BookmarksPageState extends ConsumerState<BookmarksPage> {
   String? _selectedBookmarkName;
   BookmarksWorkspaceState _workspaceState = const BookmarksWorkspaceState();
 
+  /// 桌面端 Esc 退出书签页(maybePop 会依次经过 PopScope:搜索模式先退
+  /// 搜索、手机工作区先回书签标签,最后才真正 pop 路由)。
+  late final ShortcutScopeBinding _shortcutScopeBinding = ShortcutScopeBinding(
+    ref: ref,
+    scope: ShortcutScope.context,
+    // 底栏 tab 形态挂在 IndexedStack 里:不活跃时注册失效,否则截胡
+    // 其他 tab 的 ESC(共享根路由,路由过滤分不出活跃 tab)。
+    enabled: () => widget.isActive,
+  );
+
   @override
   void initState() {
     super.initState();
+    if (PlatformUtils.isDesktop) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _shortcutScopeBinding.register(context, {
+          ShortcutAction.closeOverlay: () {
+            if (mounted) Navigator.of(context).maybePop();
+          },
+        });
+      });
+    }
     _scrollController.addListener(_onScroll);
     _searchNotifier = ref.read(
       userContentSearchProvider(SearchInType.bookmarks).notifier,
@@ -88,6 +112,7 @@ class _BookmarksPageState extends ConsumerState<BookmarksPage> {
 
   @override
   void dispose() {
+    _shortcutScopeBinding.disposeDeferred();
     _setMobileBottomBarHidden(false);
     _scrollController.dispose();
     Future.microtask(_searchNotifier.exitSearchMode);
@@ -134,9 +159,9 @@ class _BookmarksPageState extends ConsumerState<BookmarksPage> {
   }
 
   Future<void> _onManualSync() async {
-    final notifier = ref.read(bookmarksProvider.notifier);
-    if (notifier.isReconciling) return;
-    final report = await notifier.manualFullReconcile();
+    final syncController = ref.read(bookmarkSyncControllerProvider.notifier);
+    if (ref.read(bookmarkSyncControllerProvider).isSyncing) return;
+    final report = await syncController.manualFullSync();
     if (!mounted) return;
     if (report == null) {
       ToastService.showError(S.current.bookmarks_syncFailed);
@@ -156,6 +181,14 @@ class _BookmarksPageState extends ConsumerState<BookmarksPage> {
   }
 
   void _onBookmarkTap(Topic topic) {
+    // chat 消息书签:走统一链接分发进原生频道页(带消息锚点)
+    if (topic.isChatMessageBookmark) {
+      final url = topic.bookmarkableUrl;
+      if (url != null && url.isNotEmpty) {
+        launchContentLink(context, url);
+      }
+      return;
+    }
     final preferences = ref.read(preferencesProvider);
     if (_useWorkspace(preferences)) {
       _openTopicInWorkspace(
@@ -262,6 +295,14 @@ class _BookmarksPageState extends ConsumerState<BookmarksPage> {
   }
 
   void _onBookmarkMiddleClick(Topic topic) {
+    // chat 书签没有话题上下文,中键也走链接分发进频道页
+    if (topic.isChatMessageBookmark) {
+      final url = topic.bookmarkableUrl;
+      if (url != null && url.isNotEmpty) {
+        launchContentLink(context, url);
+      }
+      return;
+    }
     final preferences = ref.read(preferencesProvider);
     if (!_useDesktopWorkspace(preferences)) {
       return;
@@ -559,12 +600,15 @@ class _BookmarksPageState extends ConsumerState<BookmarksPage> {
   }
 
   Widget _buildSyncAction() {
-    final notifier = ref.watch(bookmarksProvider.notifier);
-    final isReconciling = notifier.isReconciling;
+    // 同步状态来自全局 controller:与列表数据/分页 loading 彻底分离,
+    // 静默增量同步只在这里转圈,不再牵动列表 footer。
+    final isSyncing = ref.watch(
+      bookmarkSyncControllerProvider.select((s) => s.isSyncing),
+    );
     return IconButton(
       tooltip: context.l10n.bookmarks_syncBookmarks,
-      onPressed: isReconciling ? null : _onManualSync,
-      icon: isReconciling
+      onPressed: isSyncing ? null : _onManualSync,
+      icon: isSyncing
           ? const LoadingSpinner(size: 18)
           : const Icon(Symbols.sync_rounded),
     );
@@ -663,7 +707,7 @@ class _BookmarksPageState extends ConsumerState<BookmarksPage> {
       final notifier = ref.read(bookmarkNameSuggestionsProvider.notifier);
       final bookmarksState = ref.read(bookmarksProvider.notifier);
       final isCompleteSnapshot =
-          !bookmarksState.isHydratingAll &&
+          !ref.read(bookmarkSyncControllerProvider).isSyncing &&
           !bookmarksState.hasMore &&
           !bookmarksState.isLoadMoreFailed;
       notifier.seedFromTopics(topics, isCompleteSnapshot: isCompleteSnapshot);
@@ -780,6 +824,9 @@ class _BookmarksPageState extends ConsumerState<BookmarksPage> {
             activeTabId: _workspaceState.activeTabId,
             topicTabs: _workspaceState.topicTabs,
             bookmarksLabel: context.l10n.bookmarks_title,
+            onBack: Navigator.of(context).canPop()
+                ? () => Navigator.of(context).maybePop()
+                : null,
             isSearchMode: searchState.isSearchMode,
             onSearchTap: () => _onSearchPressed(true),
             onBookmarksTap: () {
@@ -839,7 +886,12 @@ class _BookmarksPageState extends ConsumerState<BookmarksPage> {
             },
             hasMore: bookmarksNotifier.hasMore,
             isLoadMoreFailed: bookmarksNotifier.isLoadMoreFailed,
-            isLoadingMore: bookmarksNotifier.isHydratingAll,
+            // footer 只反映本地分页 hydrate,对账/同步不再牵动列表 loading
+            isLoadingMore: bookmarksNotifier.isLoadingMore,
+            syncState: ref.watch(bookmarkSyncControllerProvider),
+            onRetrySync: () => ref
+                .read(bookmarkSyncControllerProvider.notifier)
+                .ensureFreshness(force: true),
             onRetryLoadMore: bookmarksNotifier.retryLoadMore,
             onEditBookmark: _editBookmark,
             onQuickRenameBookmark: _quickRenameBookmark,
@@ -926,15 +978,19 @@ class _BookmarksPageState extends ConsumerState<BookmarksPage> {
     final bookmarkId = topic.bookmarkId;
     if (bookmarkId == null) return;
 
+    // 乐观删除:先移本地条目让列表立即响应,服务端失败再回滚。
+    final notifier = ref.read(bookmarksProvider.notifier);
+    final backup = await notifier.removeBookmarkOptimistically(bookmarkId);
     try {
       await DiscourseService().deleteBookmark(bookmarkId);
       if (!mounted) return;
-      ref.read(bookmarksProvider.notifier).removeBookmarkById(bookmarkId);
       ref.read(bookmarkNameSuggestionsProvider.notifier).markDirty();
       ToastService.showSuccess(S.current.bookmarks_deleted);
     } on DioException catch (_) {
-      // 网络错误已由 ErrorInterceptor 处理
+      // 网络错误已由 ErrorInterceptor 处理;回滚本地条目
+      await notifier.restoreBookmark(backup);
     } catch (e, s) {
+      await notifier.restoreBookmark(backup);
       AppErrorHandler.handleUnexpected(e, s);
     }
   }
