@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/nested_topic.dart';
 import '../models/topic.dart';
 import '../services/discourse/discourse_service.dart';
+import '../services/preloaded_data_service.dart';
 import 'core_providers.dart';
 
 /// 嵌套视图参数
@@ -102,7 +103,9 @@ class NestedTopicState {
       pinnedPostIds: pinnedPostIds ?? this.pinnedPostIds,
       isLoadingMore: isLoadingMore ?? this.isLoadingMore,
       newRootPostIds: newRootPostIds ?? this.newRootPostIds,
-      lastChildCreated: clearLastChildCreated ? null : (lastChildCreated ?? this.lastChildCreated),
+      lastChildCreated: clearLastChildCreated
+          ? null
+          : (lastChildCreated ?? this.lastChildCreated),
       contextMode: contextMode ?? this.contextMode,
       contextChain: contextChain ?? this.contextChain,
       targetPostNumber: targetPostNumber ?? this.targetPostNumber,
@@ -127,7 +130,12 @@ class NestedTopicNotifier extends AsyncNotifier<NestedTopicState> {
       return _loadContext(service, target, sort: 'old', trackVisit: true);
     }
 
-    final response = await service.getNestedRoots(arg.topicId, sort: 'old', page: 0, trackVisit: true);
+    final response = await service.getNestedRoots(
+      arg.topicId,
+      sort: 'old',
+      page: 0,
+      trackVisit: true,
+    );
 
     return NestedTopicState(
       topicJson: response.topicJson,
@@ -192,12 +200,14 @@ class NestedTopicNotifier extends AsyncNotifier<NestedTopicState> {
 
       if (!ref.mounted) return;
       // ignore: invalid_use_of_protected_member, invalid_use_of_visible_for_testing_member
-      state = AsyncValue.data(current.copyWith(
-        roots: [...current.roots, ...response.roots],
-        hasMoreRoots: response.hasMoreRoots,
-        currentPage: nextPage,
-        isLoadingMore: false,
-      ));
+      state = AsyncValue.data(
+        current.copyWith(
+          roots: [...current.roots, ...response.roots],
+          hasMoreRoots: response.hasMoreRoots,
+          currentPage: nextPage,
+          isLoadingMore: false,
+        ),
+      );
     } catch (e) {
       debugPrint('[NestedTopic] loadMoreRoots failed: $e');
       if (!ref.mounted) return;
@@ -230,19 +240,25 @@ class NestedTopicNotifier extends AsyncNotifier<NestedTopicState> {
         return;
       }
 
-      final response = await service.getNestedRoots(arg.topicId, sort: newSort, page: 0);
+      final response = await service.getNestedRoots(
+        arg.topicId,
+        sort: newSort,
+        page: 0,
+      );
 
       if (!ref.mounted) return;
       // ignore: invalid_use_of_protected_member, invalid_use_of_visible_for_testing_member
-      state = AsyncValue.data(NestedTopicState(
-        topicJson: current.topicJson,
-        opPost: current.opPost,
-        roots: response.roots,
-        hasMoreRoots: response.hasMoreRoots,
-        currentPage: 0,
-        sort: newSort,
-        pinnedPostIds: response.pinnedPostIds,
-      ));
+      state = AsyncValue.data(
+        NestedTopicState(
+          topicJson: current.topicJson,
+          opPost: current.opPost,
+          roots: response.roots,
+          hasMoreRoots: response.hasMoreRoots,
+          currentPage: 0,
+          sort: newSort,
+          pinnedPostIds: response.pinnedPostIds,
+        ),
+      );
     } catch (e, s) {
       if (!ref.mounted) return;
       // ignore: invalid_use_of_protected_member, invalid_use_of_visible_for_testing_member
@@ -250,8 +266,65 @@ class NestedTopicNotifier extends AsyncNotifier<NestedTopicState> {
     }
   }
 
+  /// 更新帖子的解决方案状态（树节点卡片重建时盖章不丢）
+  ///
+  /// 与平铺 [TopicDetailNotifier.updatePostSolution] 同语义:
+  /// 单解决方案模式(`solved_allow_multiple_solutions=false`)接受新答案时清空其他。
+  /// 懒加载的子节点挂在各卡片本地状态里、不在 provider 状态中,覆盖不到属正常
+  /// (卡片本地 _acceptedAnswer 已即时反馈)。
+  // ignore: invalid_use_of_protected_member, invalid_use_of_visible_for_testing_member
+  void updatePostSolution(int postId, bool accepted) {
+    final current = state.value;
+    if (current == null) return;
+
+    final allowMultiple =
+        PreloadedDataService()
+            .siteSettingsSync?['solved_allow_multiple_solutions'] ==
+        true;
+
+    Post mapPost(Post post) {
+      if (post.id == postId) {
+        return post.copyWith(
+          acceptedAnswer: accepted,
+          canUnacceptAnswer: accepted,
+        );
+      } else if (accepted && !allowMultiple && post.acceptedAnswer) {
+        return post.copyWith(acceptedAnswer: false, canUnacceptAnswer: false);
+      }
+      return post;
+    }
+
+    NestedNode mapNode(NestedNode node) {
+      final newPost = mapPost(node.post);
+      if (node.children.isEmpty) {
+        return identical(newPost, node.post)
+            ? node
+            : node.copyWith(post: newPost);
+      }
+      return node.copyWith(
+        post: newPost,
+        children: node.children.map(mapNode).toList(),
+      );
+    }
+
+    final opPost = current.opPost;
+    state = AsyncValue.data(
+      current.copyWith(
+        opPost: opPost == null ? null : mapPost(opPost),
+        roots: current.roots.map(mapNode).toList(),
+        contextChain: current.contextChain == null
+            ? null
+            : mapNode(current.contextChain!),
+      ),
+    );
+  }
+
   /// 懒加载子回复
-  Future<NestedChildrenResponse> loadChildren(int postNumber, {int page = 0, int depth = 1}) async {
+  Future<NestedChildrenResponse> loadChildren(
+    int postNumber, {
+    int page = 0,
+    int depth = 1,
+  }) async {
     final current = state.value;
     final service = ref.read(discourseServiceProvider);
     return service.getNestedChildren(
@@ -280,22 +353,26 @@ class NestedTopicNotifier extends AsyncNotifier<NestedTopicState> {
       if (current.contextMode) return;
       if (isOwnPost) {
         final newNode = NestedNode(post: post);
-        state = AsyncValue.data(current.copyWith(
-          roots: [newNode, ...current.roots],
-        ));
+        state = AsyncValue.data(
+          current.copyWith(roots: [newNode, ...current.roots]),
+        );
       } else {
         if (current.newRootPostIds.contains(post.id)) return;
-        state = AsyncValue.data(current.copyWith(
-          newRootPostIds: [...current.newRootPostIds, post.id],
-        ));
+        state = AsyncValue.data(
+          current.copyWith(
+            newRootPostIds: [...current.newRootPostIds, post.id],
+          ),
+        );
       }
     } else {
-      state = AsyncValue.data(current.copyWith(
-        lastChildCreated: NestedChildCreatedEvent(
-          post: post,
-          parentPostNumber: replyTo,
+      state = AsyncValue.data(
+        current.copyWith(
+          lastChildCreated: NestedChildCreatedEvent(
+            post: post,
+            parentPostNumber: replyTo,
+          ),
         ),
-      ));
+      );
     }
   }
 
@@ -328,12 +405,14 @@ class NestedTopicNotifier extends AsyncNotifier<NestedTopicState> {
       final updated = state.value;
       if (updated == null) return;
       final existingIds = updated.roots.map((n) => n.post.id).toSet();
-      final filtered = newNodes.where((n) => !existingIds.contains(n.post.id)).toList();
+      final filtered = newNodes
+          .where((n) => !existingIds.contains(n.post.id))
+          .toList();
       if (filtered.isEmpty) return;
 
-      state = AsyncValue.data(updated.copyWith(
-        roots: [...filtered, ...updated.roots],
-      ));
+      state = AsyncValue.data(
+        updated.copyWith(roots: [...filtered, ...updated.roots]),
+      );
     } catch (e) {
       debugPrint('[NestedTopic] loadNewRoots failed: $e');
     }
@@ -348,6 +427,7 @@ class NestedTopicNotifier extends AsyncNotifier<NestedTopicState> {
   }
 }
 
-final nestedTopicProvider = AsyncNotifierProvider.family.autoDispose<NestedTopicNotifier, NestedTopicState, NestedTopicParams>(
-  NestedTopicNotifier.new,
-);
+final nestedTopicProvider = AsyncNotifierProvider.family
+    .autoDispose<NestedTopicNotifier, NestedTopicState, NestedTopicParams>(
+      NestedTopicNotifier.new,
+    );

@@ -391,8 +391,10 @@ class ChatMessagesNotifier extends AsyncNotifier<ChatMessagesState> {
   // ========== 分页 ==========
 
   /// 分页拉取:按流身份分发到频道/thread 端点
+  /// [direction] 为 null 时是"锚点窗口"用法:服务端取 [targetMessageId]
+  /// 前后各半页(见 _chat.dart 的三种用法说明)
   Future<ChatMessagesResponse> _fetchPage({
-    required String direction,
+    String? direction,
     required int targetMessageId,
   }) {
     final service = ref.read(discourseServiceProvider);
@@ -483,6 +485,40 @@ class ChatMessagesNotifier extends AsyncNotifier<ChatMessagesState> {
         state = AsyncData(fresh.copyWith(loadingFuture: false));
       }
     }
+  }
+
+  /// 原地把消息窗口换成以 [messageId] 为中心的一页(跳转定位用)
+  ///
+  /// 不换 provider key:key 里带锚点会造出全新 notifier 实例,连带
+  /// 重订阅 MessageBus、重拉频道详情、重置已读位、丢弃未发出的 staged
+  /// 消息 —— 跳转不该付这些代价。目标已在窗口内时零成本返回。
+  ///
+  /// 返回 true = 目标在新窗口内(调用方可以去测几何了)。
+  /// 失败时抛给调用方,旧窗口保持不动。
+  Future<bool> loadWindowAround(int messageId) async {
+    final current = state.value;
+    if (current == null) return false;
+    if (current.messages.any((m) => m.id == messageId)) return true;
+
+    final page = await _fetchPage(targetMessageId: messageId);
+    final fresh = state.value;
+    if (fresh == null) return false;
+    // 整体替换而非并集:锚点窗口与旧窗口之间可能隔着大段未加载消息,
+    // 拼起来会得到一条中间有空洞的假连续消息流
+    final messages = [...page.messages]..sort((a, b) => a.id.compareTo(b.id));
+    // 未发出的乐观消息不属于任何服务端窗口,跟到新窗口尾部免得丢草稿
+    final staged = fresh.messages.where((m) => m.isStaged);
+    state = AsyncData(
+      fresh.copyWith(
+        messages: [...messages, ...staged],
+        canLoadMorePast: page.canLoadMorePast,
+        canLoadMoreFuture: page.canLoadMoreFuture,
+        // 窗口整体换掉,原窗口的分页在途标志不再适用
+        loadingPast: false,
+        loadingFuture: false,
+      ),
+    );
+    return messages.any((m) => m.id == messageId);
   }
 
   // ========== 发送(乐观) ==========

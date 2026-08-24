@@ -15,7 +15,10 @@ import '../../utils/fluxdo_render_callbacks.dart';
 import '../../utils/responsive.dart';
 import '../../utils/time_utils.dart';
 import '../post/post_item/quote_selection_helper.dart';
+import '../crypto/crypto_decrypt_sheet.dart';
+import '../../services/crypto/crypto_cipher_format.dart';
 import '../post/post_item/widgets/post_footer_section/post_footer_section.dart';
+import '../post/post_item/widgets/post_stamp_painter.dart';
 import '../post/post_signature_block.dart';
 import '../post/small_action_item.dart';
 import '../common/radial_long_press_menu.dart';
@@ -113,6 +116,10 @@ class _NestedPostCardState extends ConsumerState<NestedPostCard> {
   late bool _expanded;
   late bool _collapsed;
   late List<NestedNode> _children;
+
+  /// 解决方案盖章状态(镜像平铺 PostItem._acceptedAnswer 模式:
+  /// 菜单采纳/取消后由 footer 回调即时更新,provider 同步兜底重建一致性)
+  late bool _acceptedAnswer;
   bool _isLoadingMore = false;
   bool _hasMore = false;
   int _page = 0;
@@ -123,11 +130,8 @@ class _NestedPostCardState extends ConsumerState<NestedPostCard> {
   /// didUpdateWidget，两处都手动失效即可安全复用
   List<NestedNode>? _visibleChildrenCache;
 
-  List<NestedNode> get _visibleChildren =>
-      _visibleChildrenCache ??= BlockedUserFilter.visibleNestedNodes(
-        _children,
-        widget.blockedUsernames,
-      );
+  List<NestedNode> get _visibleChildren => _visibleChildrenCache ??=
+      BlockedUserFilter.visibleNestedNodes(_children, widget.blockedUsernames);
 
   @override
   void didUpdateWidget(covariant NestedPostCard oldWidget) {
@@ -136,6 +140,10 @@ class _NestedPostCardState extends ConsumerState<NestedPostCard> {
         !identical(oldWidget.node, widget.node)) {
       _visibleChildrenCache = null;
     }
+    // provider 同步解决方案状态后(node 换新)回填盖章
+    if (!identical(oldWidget.node, widget.node)) {
+      _acceptedAnswer = widget.node.post.acceptedAnswer;
+    }
   }
 
   @override
@@ -143,7 +151,7 @@ class _NestedPostCardState extends ConsumerState<NestedPostCard> {
     super.initState();
     _children = List.from(widget.node.children);
     _hasMore = widget.node.hasMoreChildren;
-
+    _acceptedAnswer = widget.node.post.acceptedAnswer;
     // 从状态存储恢复，否则有预加载子节点就展开
     final cached = widget.expansionState?[widget.node.post.postNumber];
     if (cached != null) {
@@ -584,81 +592,111 @@ class _NestedPostCardState extends ConsumerState<NestedPostCard> {
   Widget _buildArticle(ThemeData theme, Post post, {bool isMobile = false}) {
     final isOp = widget.detail.createdBy?.username == post.username;
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
+    // 解决方案水印章:与平铺 PostHeaderSection 同款(nested API 带
+    // accepted_answer/can_accept_answer,OP 帖走 PostItem 已有,树节点补齐)
+    final showStamp = _acceptedAnswer || post.canAcceptAnswer;
+
+    return Stack(
+      clipBehavior: Clip.none,
       children: [
-        // Header
-        _buildHeader(theme, post, isOp, isMobile: isMobile),
-        const SizedBox(height: 4),
-        // Content(自研逻辑选区,与平铺 PostItem 同链路:
-        // toolbar「引用」→ onQuoteSelection,未登录/未接线自动降级只留复制)
-        Listener(
-          behavior: HitTestBehavior.translucent,
-          onPointerDown: (_) => CodeSelectionContextTracker.instance.clear(),
-          child: FluxdoRenderCallbacks.forPost(
-            post: post,
-            topicId: widget.topicId,
-          ).render(
-            cookedHtml: post.cooked,
-            baseTextStyle: theme.textTheme.bodyMedium?.copyWith(
-              height: 1.5,
-              fontSize:
-                  (theme.textTheme.bodyMedium?.fontSize ?? 14) *
-                  ref.watch(preferencesProvider).contentFontScale,
-            ),
-            selectionEnabled: true,
-            selectionScopeId: post.id,
-            onQuoteRequest: widget.onQuoteSelection == null
-                ? null
-                : (plainText) => widget.onQuoteSelection!(plainText, post),
-            onCopyQuoteRequest: (plainText) =>
-                QuoteSelectionHelper.copyQuoteToClipboard(
-                  selectedText: plainText,
-                  post: post,
-                  topicId: widget.topicId,
-                ),
-            onCopyToast: () => ToastService.showSuccess(
-              context.l10n.common_copiedToClipboard,
-            ),
+        if (showStamp)
+          Positioned(
+            right: 20,
+            top: 10,
+            child: PostSolutionStamp(accepted: _acceptedAnswer),
           ),
-        ),
-        // 用户签名
-        if (PostSignatureBlock.shouldRender(
-          ref,
-          post,
-          categoryId: widget.detail.categoryId,
-        ))
-          PostSignatureBlock(
-            post: post,
-            categoryId: widget.detail.categoryId,
-            fontSize: 11,
-            spacing: 6,
-          ),
-        // 完整操作栏（复用 PostFooterSection，隐藏回复展开按钮）
-        PostFooterSection(
-          post: post,
-          topicId: widget.topicId,
-          topicHasAcceptedAnswer: widget.detail.hasAcceptedAnswer,
-          acceptedAnswers: widget.detail.acceptedAnswers,
-          padding: const EdgeInsets.only(top: 4),
-          onReply: widget.isLoggedIn
-              ? ({initialContent}) => widget.onReply(
-                  post.postNumber == 1 ? null : post,
-                  initialContent: initialContent,
-                )
-              : null,
-          onEdit: widget.isLoggedIn && post.canEdit
-              ? () => widget.onEdit(post)
-              : null,
-          onShareAsImage: null,
-          onRefreshPost: widget.onRefreshPost,
-          onJumpToPost: widget.onJumpToPost,
-          onSolutionChanged: widget.onSolutionChanged,
-          topicTitle: widget.detail.title,
-          isPrivateMessageTopic: widget.detail.isPrivateMessage,
-          isPmWithNonHumanUser: widget.detail.pmWithNonHumanUser,
-          hideRepliesButton: true,
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Header
+            _buildHeader(theme, post, isOp, isMobile: isMobile),
+            const SizedBox(height: 4),
+            // Content(自研逻辑选区,与平铺 PostItem 同链路:
+            // toolbar「引用」→ onQuoteSelection,未登录/未接线自动降级只留复制)
+            Listener(
+              behavior: HitTestBehavior.translucent,
+              onPointerDown: (_) =>
+                  CodeSelectionContextTracker.instance.clear(),
+              child:
+                  FluxdoRenderCallbacks.forPost(
+                    post: post,
+                    topicId: widget.topicId,
+                  ).render(
+                    cookedHtml: post.cooked,
+                    baseTextStyle: theme.textTheme.bodyMedium?.copyWith(
+                      height: 1.5,
+                      fontSize:
+                          (theme.textTheme.bodyMedium?.fontSize ?? 14) *
+                          ref.watch(preferencesProvider).contentFontScale,
+                    ),
+                    selectionEnabled: true,
+                    selectionScopeId: post.id,
+                    onQuoteRequest: widget.onQuoteSelection == null
+                        ? null
+                        : (plainText) =>
+                              widget.onQuoteSelection!(plainText, post),
+                    onCopyQuoteRequest: (plainText) =>
+                        QuoteSelectionHelper.copyQuoteToClipboard(
+                          selectedText: plainText,
+                          post: post,
+                          topicId: widget.topicId,
+                        ),
+                    onCopyToast: () => ToastService.showSuccess(
+                      context.l10n.common_copiedToClipboard,
+                    ),
+                    onDecryptRequest: (plainText) => showCryptoDecryptSheet(
+                      context: context,
+                      initialCiphertext: plainText,
+                      onQuoteReply: widget.onQuoteSelection == null
+                          ? null
+                          : (plaintext) =>
+                              widget.onQuoteSelection!(plaintext, post),
+                    ),
+                    decryptTextDetector: isDecryptableText,
+                  ),
+            ),
+            // 用户签名
+            if (PostSignatureBlock.shouldRender(
+              ref,
+              post,
+              categoryId: widget.detail.categoryId,
+            ))
+              PostSignatureBlock(
+                post: post,
+                categoryId: widget.detail.categoryId,
+                fontSize: 11,
+                spacing: 6,
+              ),
+            // 完整操作栏（复用 PostFooterSection，隐藏回复展开按钮）
+            PostFooterSection(
+              post: post,
+              topicId: widget.topicId,
+              topicHasAcceptedAnswer: widget.detail.hasAcceptedAnswer,
+              acceptedAnswers: widget.detail.acceptedAnswers,
+              padding: const EdgeInsets.only(top: 4),
+              onReply: widget.isLoggedIn
+                  ? ({initialContent}) => widget.onReply(
+                      post.postNumber == 1 ? null : post,
+                      initialContent: initialContent,
+                    )
+                  : null,
+              onEdit: widget.isLoggedIn && post.canEdit
+                  ? () => widget.onEdit(post)
+                  : null,
+              onShareAsImage: null,
+              onRefreshPost: widget.onRefreshPost,
+              onJumpToPost: widget.onJumpToPost,
+              onSolutionChanged: widget.onSolutionChanged,
+              onAcceptedAnswerChanged: (accepted) {
+                setState(() => _acceptedAnswer = accepted);
+              },
+              topicTitle: widget.detail.title,
+              isPrivateMessageTopic: widget.detail.isPrivateMessage,
+              isPmWithNonHumanUser: widget.detail.pmWithNonHumanUser,
+              hideRepliesButton: true,
+            ),
+          ],
         ),
       ],
     );

@@ -14,6 +14,7 @@ import '../widgets/search/search_filter_panel.dart';
 import '../widgets/search/search_list_skeleton.dart';
 import '../widgets/search/search_post_card.dart';
 import '../widgets/search/search_preview_dialog.dart';
+import '../widgets/topic/topic_preview_dialog.dart' show topicCardAnchorRect;
 import '../providers/preferences_provider.dart';
 import '../providers/selected_topic_provider.dart';
 import '../providers/shortcut_provider.dart';
@@ -1261,66 +1262,73 @@ class _SearchPageState extends ConsumerState<SearchPage> {
           child: SearchPostPrewarmScope(
             posts: posts,
             child: ListView.builder(
-            controller: _scrollController,
-            addAutomaticKeepAlives: false,
-            padding: const EdgeInsets.all(16),
-            itemCount:
-                posts.length + (users.isNotEmpty ? users.length + 1 : 0) + 1,
-            itemBuilder: (context, index) {
-              // 帖子结果（标准 + AI 混合）
-              if (index < posts.length) {
-                final searchPost = posts[index];
-                final enableLongPress = ref
-                    .watch(preferencesProvider)
-                    .longPressPreview;
-                return SearchPostCard(
-                  post: searchPost,
-                  onTap: () => _openTopicResult(searchPost),
-                  onLongPress: enableLongPress
-                      ? () => SearchPreviewDialog.show(
-                          context,
-                          post: searchPost,
-                          onOpen: () => _openTopicResult(searchPost),
-                        )
-                      : null,
-                );
-              }
-
-              // 用户标题
-              final userStartIndex = posts.length;
-              if (users.isNotEmpty && index == userStartIndex) {
-                return Padding(
-                  padding: const EdgeInsets.only(top: 16, bottom: 8),
-                  child: _buildSectionHeader(
-                    context.l10n.search_users,
-                    users.length,
-                    _hasMoreUsers,
-                  ),
-                );
-              }
-
-              // 用户结果
-              if (users.isNotEmpty && index > userStartIndex) {
-                final userIndex = index - userStartIndex - 1;
-                if (userIndex < users.length) {
-                  return _SearchUserCard(
-                    user: users[userIndex],
-                    onTap: () => _openUserResult(users[userIndex]),
+              controller: _scrollController,
+              addAutomaticKeepAlives: false,
+              padding: const EdgeInsets.all(16),
+              itemCount:
+                  posts.length + (users.isNotEmpty ? users.length + 1 : 0) + 1,
+              itemBuilder: (context, index) {
+                // 帖子结果（标准 + AI 混合）
+                if (index < posts.length) {
+                  final searchPost = posts[index];
+                  final enableLongPress = ref
+                      .watch(preferencesProvider)
+                      .longPressPreview;
+                  // Builder 紧贴卡片:一镜到底要卡片自身的屏幕 rect 作
+                  // 起点(外层 context 在桌面端 Center 包装下是满宽);
+                  // bottomGap 8 裁掉外壳底部间距
+                  return Builder(
+                    builder: (cardContext) => SearchPostCard(
+                      post: searchPost,
+                      onTap: () => _openTopicResult(searchPost),
+                      onLongPress: enableLongPress
+                          ? () => SearchPreviewDialog.show(
+                              context,
+                              post: searchPost,
+                              onOpen: () => _openTopicResult(searchPost),
+                              anchorRect: topicCardAnchorRect(cardContext),
+                            )
+                          : null,
+                    ),
                   );
                 }
-              }
 
-              return PagedListFooter(
-                hasMore: _hasMorePosts,
-                isLoadingMore: _loadMoreCoordinator.isRunning && _isLoadingMore,
-                isLoadMoreFailed: _isLoadMoreFailed,
-                onRetry: () {
-                  _loadMoreCoordinator.resetCooldown();
-                  setState(() => _isLoadMoreFailed = false);
-                  _loadMore();
-                },
-              );
-            },
+                // 用户标题
+                final userStartIndex = posts.length;
+                if (users.isNotEmpty && index == userStartIndex) {
+                  return Padding(
+                    padding: const EdgeInsets.only(top: 16, bottom: 8),
+                    child: _buildSectionHeader(
+                      context.l10n.search_users,
+                      users.length,
+                      _hasMoreUsers,
+                    ),
+                  );
+                }
+
+                // 用户结果
+                if (users.isNotEmpty && index > userStartIndex) {
+                  final userIndex = index - userStartIndex - 1;
+                  if (userIndex < users.length) {
+                    return _SearchUserCard(
+                      user: users[userIndex],
+                      onTap: () => _openUserResult(users[userIndex]),
+                    );
+                  }
+                }
+
+                return PagedListFooter(
+                  hasMore: _hasMorePosts,
+                  isLoadingMore:
+                      _loadMoreCoordinator.isRunning && _isLoadingMore,
+                  isLoadMoreFailed: _isLoadMoreFailed,
+                  onRetry: () {
+                    _loadMoreCoordinator.resetCooldown();
+                    setState(() => _isLoadMoreFailed = false);
+                    _loadMore();
+                  },
+                );
+              },
             ),
           ),
         ),

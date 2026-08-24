@@ -501,15 +501,12 @@ mixin _TopicsMixin on _DiscourseServiceBase {
     return watchTopicSummary(topicId, skipAgeCheck: skipAgeCheck).last;
   }
 
-  /// 获取话题主贴的 HTML 内容（轻量请求，只解析第一楼）
+  /// 获取话题主贴的 HTML 内容
+  /// 走 posts#by_number 单帖接口(只回一帖 JSON),
+  /// 比 /t/:id/1.json 的 TopicView(20 楼 chunk + 话题详情)轻量得多
   Future<String?> getTopicFirstPostCooked(int topicId) async {
-    final response = await _dio.get('/t/$topicId/1.json');
-    final data = response.data as Map<String, dynamic>;
-    final postStream = data['post_stream'] as Map<String, dynamic>?;
-    final posts = postStream?['posts'] as List<dynamic>?;
-    if (posts == null || posts.isEmpty) return null;
-    final firstPost = posts.first as Map<String, dynamic>;
-    return firstPost['cooked'] as String?;
+    final response = await _dio.get('/posts/by_number/$topicId/1.json');
+    return (response.data as Map<String, dynamic>)['cooked'] as String?;
   }
 }
 

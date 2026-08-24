@@ -60,6 +60,11 @@ class User {
   final bool? canSendPrivateMessageToUser;   // 是否可以给该用户发私信
   final bool? canChatUser;                   // 是否可与该用户聊天(chat 插件 user_card 注入)
 
+  /// 该用户在某话题内的发帖数(card.json 带 include_post_count_for=topicId
+  /// 时 serializer 注入,形如 {topic_id: count};官方用它决定用户卡片
+  /// 是否显示「过滤到该用户的 N 帖」按钮)
+  final Map<int, int> topicPostCount;
+
   // 积分相关
   final int? gamificationScore;
 
@@ -133,6 +138,7 @@ class User {
     this.canSendPrivateMessages,
     this.canSendPrivateMessageToUser,
     this.canChatUser,
+    this.topicPostCount = const {},
     this.gamificationScore,
     this.muted,
     this.ignored,
@@ -201,6 +207,7 @@ class User {
       canSendPrivateMessages: canSendPrivateMessages,
       canSendPrivateMessageToUser: canSendPrivateMessageToUser,
       canChatUser: canChatUser,
+      topicPostCount: topicPostCount,
       gamificationScore: gamificationScore,
       muted: muted ?? this.muted,
       ignored: ignored ?? this.ignored,
@@ -270,6 +277,13 @@ class User {
       canSendPrivateMessages: json['can_send_private_messages'] as bool?,
       canSendPrivateMessageToUser: json['can_send_private_message_to_user'] as bool?,
       canChatUser: json['can_chat_user'] as bool?,
+      topicPostCount: {
+        for (final e
+            in (json['topic_post_count'] as Map<String, dynamic>? ?? const {})
+                .entries)
+          if (int.tryParse(e.key) != null && e.value is int)
+            int.parse(e.key): e.value as int,
+      },
       gamificationScore: json['gamification_score'] as int?,
       muted: json['muted'] as bool?,
       ignored: json['ignored'] as bool?,

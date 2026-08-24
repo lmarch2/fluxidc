@@ -247,7 +247,19 @@ class _ProfilePageState extends ConsumerState<ProfilePage> {
     );
 
     if (confirmed == true && mounted) {
-      LoadingDialog.show(context, message: context.l10n.profile_loggingOut);
+      // provider 容器要在 widget 销毁前取好:resetForLogout 执行时本页可能
+      // 已经不在树上,那时再 ProviderScope.containerOf(context) 会失败。
+      final container = ProviderScope.containerOf(context, listen: false);
+
+      // 用 controller 而非静态 hide(context):resetForLogout 会 invalidate
+      // 整棵 provider 树,本页 widget 随之销毁,mounted 变 false —— 若用
+      // `if (mounted) LoadingDialog.hide(context)`,这段会被整体跳过,弹窗
+      // 永久留在根 navigator 上(现象:一直卡「正在退出…」)。
+      // controller 持有 NavigatorState,不依赖本 widget 的生命周期。
+      final loading = LoadingDialog.show(
+        context,
+        message: context.l10n.profile_loggingOut,
+      );
 
       // 记录主动退出日志
       LogWriter.instance.write({
@@ -258,15 +270,23 @@ class _ProfilePageState extends ConsumerState<ProfilePage> {
         'message': '用户主动退出登录',
       });
 
-      await ref.read(discourseServiceProvider).logout(callApi: true);
-      if (mounted) {
-        await AppStateRefresher.resetForLogout(
-          ProviderScope.containerOf(context, listen: false),
-        );
-      }
-
-      if (mounted) {
-        LoadingDialog.hide(context);
+      try {
+        await ref.read(discourseServiceProvider).logout(callApi: true);
+        // 这里刻意不判 mounted:provider 容器的生命周期与本 widget 无关,
+        // 状态重置必须执行完(否则登出后残留上一个账号的缓存)。
+        await AppStateRefresher.resetForLogout(container);
+      } catch (e) {
+        debugPrint('[ProfilePage] 退出登录异常: $e');
+        LogWriter.instance.write({
+          'timestamp': DateTime.now().toIso8601String(),
+          'level': 'warning',
+          'type': 'lifecycle',
+          'event': 'logout_error',
+          'message': '退出登录过程出错，本地状态已尽力清理',
+          'error': e.toString(),
+        });
+      } finally {
+        loading.hide();
       }
     }
   }

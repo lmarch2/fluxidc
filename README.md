@@ -22,7 +22,7 @@
   <a href="UPSTREAM.md">上游说明</a>
 </p>
 
-FluxIDC 基于 [FluxDO](https://github.com/Lingyan000/fluxdo) v0.2.26 适配，保留其 Flutter、Discourse、WebView 登录和 Cookie 同步能力，并将站点、品牌、深链及平台包名切换到 IDC Flare。
+FluxIDC 基于 [FluxDO](https://github.com/Lingyan000/fluxdo) v0.2.27 适配，保留其 Flutter、Discourse、WebView 登录和 Cookie 同步能力，并将站点、品牌、深链及平台包名切换到 IDC Flare。
 
 > [!IMPORTANT]
 > 本项目是社区维护的非官方客户端，与 IDC Flare 官方及 FluxDO 上游作者均无隶属关系。使用前请自行判断风险并妥善保管账号数据。IDC Flare 名称与图形标志归其权利人所有。
@@ -42,7 +42,7 @@ Android 安装包按 ABI 分开构建：
 下载对应 APK 后，可直接在系统文件管理器中打开安装，或使用 ADB：
 
 ```bash
-adb install -r FluxIDC-0.2.26-arm64-v8a.apk
+adb install -r FluxIDC-0.2.27-arm64-v8a.apk
 ```
 
 未配置 Android 签名 secrets 时，CI 和本地 release 构建会回退到调试签名。不同签名的 APK 不能直接覆盖安装；遇到签名冲突时，应先备份应用数据，再卸载旧版本。
@@ -58,7 +58,7 @@ iOS Release 提供 arm64、最低 iOS 14.0 的 unsigned IPA。该文件不包含
 - iOS arm64 unsigned IPA 已完成云端构建、Bundle ID、版本、原生符号和包结构验证
 - macOS、Windows 和 Linux 工程已完成品牌与标识适配，仍需对应平台的完整构建验证
 - Web 暂不支持；动态图、DoH 代理、AVIF 和 QuickJS 等功能依赖 `dart:ffi`
-- 应用内自动更新和崩溃上报默认关闭，配置独立后端后方可启用
+- 应用内自动更新从 FluxIDC 自有 GitHub Releases 检查；崩溃上报仍默认关闭
 - Linux.DO 专属的 Credit、CDK、Connect 和元宇宙服务已关闭
 
 ## 主要功能
@@ -112,7 +112,7 @@ just test
 
 ## 站点适配
 
-IDC Flare 常量位于 `lib/constants.dart`，站点能力与安全域名配置位于 `lib/config/sites/idcflare.dart`。接入独立发布仓库或崩溃上报服务前，应先替换相应后端配置，再开启功能开关，避免读取 FluxDO 上游的发布或数据服务。
+IDC Flare 常量位于 `lib/constants.dart`，站点能力与安全域名配置位于 `lib/config/sites/idcflare.dart`。自动更新使用 FluxIDC 自有 GitHub Releases；接入崩溃上报服务前，应先替换相应后端配置，再开启功能开关，避免向 FluxDO 上游的数据服务发送信息。
 
 ## 上游与许可证
 

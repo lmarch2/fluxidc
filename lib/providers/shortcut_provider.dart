@@ -449,6 +449,7 @@ abstract final class ShortcutSurfaceIds {
   static const editComposer = 'composer.edit';
   static const postFlag = 'post.flag';
   static const postDeleteConfirm = 'post.deleteConfirm';
+  static const imageLiftMenu = 'image.imageLiftMenu';
 }
 
 abstract final class ShortcutSurfaceActionSets {

@@ -26,13 +26,27 @@ class EscFallbackObserver extends NavigatorObserver {
   /// 全局登记栈(按 push 时序,跨 Navigator 共享)。
   static final List<EscFallbackEntry> _registry = [];
 
+  /// 弹层(PopupRoute)登记表,与页面表分开:弹层不参与「路由级 ESC
+  /// 兜底」的 maybePop 链,只供分发端识别「嵌套 Navigator 上正开着
+  /// 弹层」。根 Navigator 的弹层分发端从根栈顶就能看到,但嵌套
+  /// Navigator(设置页内栏)里的底部弹框/菜单对根栈不可见——根栈顶
+  /// 仍是宿主页路由,旧流程会把 ESC 错发给页面级 surface/detail 回调
+  /// (关掉平行视界的层,弹框却还开着)。
+  static final List<EscFallbackEntry> _popupRegistry = [];
+
   /// 取当前应被 ESC 兜底关闭的登记项:LIFO 从栈顶找第一个仍 isCurrent
   /// (自己的 Navigator 视角)的路由。被弹层盖住时 isCurrent=false,
   /// 自然让位;嵌套 Navigator(设置内栏)还要求宿主路由自身也在根栈顶,
   /// 设置页被其他全屏页盖住时内栏子页不截胡。
-  static EscFallbackEntry? resolveCurrent() {
-    for (var i = _registry.length - 1; i >= 0; i--) {
-      final entry = _registry[i];
+  static EscFallbackEntry? resolveCurrent() => _resolveIn(_registry);
+
+  /// 取当前活跃的弹层登记项(判据与 [resolveCurrent] 同:自身栈顶 +
+  /// 宿主路由在根栈顶)。
+  static EscFallbackEntry? resolveCurrentPopup() => _resolveIn(_popupRegistry);
+
+  static EscFallbackEntry? _resolveIn(List<EscFallbackEntry> registry) {
+    for (var i = registry.length - 1; i >= 0; i--) {
+      final entry = registry[i];
       final navigator = entry.route.navigator;
       if (navigator == null || !navigator.mounted) continue;
       if (!entry.route.isCurrent) continue;
@@ -49,13 +63,20 @@ class EscFallbackObserver extends NavigatorObserver {
     return route is PageRoute && !route.isFirst;
   }
 
-  @override
-  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
+  void _track(Route<dynamic> route) {
     if (_shouldTrack(route)) _registry.add(EscFallbackEntry(route: route));
+    if (route is PopupRoute) {
+      _popupRegistry.add(EscFallbackEntry(route: route));
+    }
   }
+
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) =>
+      _track(route);
 
   void _remove(Route<dynamic> route) {
     _registry.removeWhere((e) => e.route == route);
+    _popupRegistry.removeWhere((e) => e.route == route);
   }
 
   @override
@@ -69,9 +90,7 @@ class EscFallbackObserver extends NavigatorObserver {
   @override
   void didReplace({Route<dynamic>? newRoute, Route<dynamic>? oldRoute}) {
     if (oldRoute != null) _remove(oldRoute);
-    if (newRoute != null && _shouldTrack(newRoute)) {
-      _registry.add(EscFallbackEntry(route: newRoute));
-    }
+    if (newRoute != null) _track(newRoute);
   }
 }
 

@@ -38,12 +38,13 @@ import '../network/cookie/cookie_jar_service.dart';
 import '../network/cookie/boundary_sync_service.dart';
 import '../network/cookie/session_snapshot.dart';
 import '../cf_challenge_service.dart';
+import '../cf_clearance_registry.dart';
 import '../message_bus_service.dart';
 import '../network/adapters/webview_http_adapter.dart';
 import '../network/webview/webview_adapter_settings_service.dart';
 import '../login_ready_coordinator.dart';
 import '../network/discourse_dio.dart';
-import '../network/interceptors/self_healing_interceptor.dart';
+import '../network/flux_request_spec.dart';
 import '../preloaded_data_service.dart';
 import '../webview_session_cookie_refresh_service.dart';
 import '../app_logger.dart';
@@ -215,6 +216,9 @@ class DiscourseService extends _DiscourseServiceBase
         },
       ),
       _storage = ResilientSecureStorage() {
+    // CSRF 刷新走这条主链(完整拦截器 + CF 兜底),不再自建独立 Dio。
+    // 独立 Dio 只装 3 个拦截器,在后台/会话失效窗口撞 CF 会静默失败。
+    _cookieSync.attachDio(_dio);
     _initInterceptors();
   }
 

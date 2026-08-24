@@ -120,6 +120,22 @@ class _KeyboardShortcutHandlerState
     final currentRoute = _currentTopRoute();
     if (currentRoute == null) return _ShortcutSurfaceDispatch.pass;
 
+    // 嵌套 Navigator(设置页内栏)上的弹层(底部弹框/菜单)对根栈不可见:
+    // 根栈顶仍是宿主页路由,旧流程会把 ESC 错发给页面级 surface/detail
+    // 回调——弹框还开着,承载它的设置页/平行视界层却被关掉,弹框跟着
+    // 整层陪葬。弹层活跃时(自身栈顶+宿主路由在根栈顶)ESC 必须先关
+    // 弹层;其余快捷键与根层弹层语义一致:modal 屏蔽。根层弹层
+    // (popup.route == currentRoute)不走此分支——surface 精确匹配的
+    // 定制 onClose 优先,兜不住的由下方 PopupRoute 分支收尾。
+    final popup = EscFallbackObserver.resolveCurrentPopup();
+    if (popup != null && !identical(popup.route, currentRoute)) {
+      if (_isCloseSurfaceAction(action)) {
+        popup.close();
+        return _ShortcutSurfaceDispatch.handled;
+      }
+      return _ShortcutSurfaceDispatch.blocked;
+    }
+
     final registry = ref.read(shortcutSurfaceRegistryProvider);
     final topSurface = resolveTopShortcutSurface(
       registry: registry,

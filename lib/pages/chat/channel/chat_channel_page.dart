@@ -5,6 +5,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:app_icons/app_icons.dart';
 import 'package:chat_bottom_container/chat_bottom_container.dart';
@@ -31,10 +32,12 @@ import '../../../utils/adaptive_menu.dart';
 import '../../../utils/dialog_utils.dart';
 import '../../../utils/fluxdo_render_callbacks.dart';
 import '../../../utils/platform_utils.dart';
+import '../../../utils/scroll_jump.dart';
 import '../../../utils/emoji_shortcodes.dart';
 import '../../../utils/time_utils.dart';
 import '../../../utils/url_helper.dart';
 import '../../../widgets/common/app_bottom_sheet.dart';
+import '../../../widgets/common/hero_image.dart';
 import '../../../widgets/common/emoji_text.dart';
 import '../../../widgets/common/error_view.dart';
 import '../../../widgets/common/height_reporter.dart';
@@ -113,6 +116,23 @@ class _ChatChannelPageState extends ConsumerState<ChatChannelPage>
   /// 高亮的消息 id(定位跳转落点,3s 后淡出)
   int? _highlightedMessageId;
 
+  /// 换窗口请求在途(盖整屏转圈;只在请求期间为 true,定位阶段已复位)
+  bool _jumping = false;
+
+  /// 跳转重入闸门(连点横幅时后一次直接忽略,不打断前一次)
+  bool _jumpLock = false;
+
+  /// 置顶横幅实占高度(浮在列表之上,跳转落点据此避让)。
+  /// 只在跳转时读一次,不驱动重建,故用普通字段而非 ValueNotifier
+  double _pinnedBannerHeight = 0;
+
+  /// 落点收尾的最大重试帧数(每帧铺开一屏,够覆盖锚点窗口的 50 条)
+  static const _settleMaxRetry = 10;
+
+  /// 首屏锚点是否已收尾(ref.listen 只在状态变化时 fire,provider 已有
+  /// 数据时不会回调,故 build 里也补一次判定,由这个标志去重)
+  bool _settledAnchor = false;
+
   /// 活动锚点(进入时=widget.initialMessageId;"回到最新"时清空并原地
   /// 换 provider key 重载,不再整页路由替换)
   int? _anchorMessageId;
@@ -178,12 +198,11 @@ class _ChatChannelPageState extends ConsumerState<ChatChannelPage>
       if (_inputController.text.isNotEmpty) _typingReporter.onTyping();
       _scheduleDraftSave();
     });
-    // 定位模式:进场即高亮目标消息
+    // 定位模式:锚点窗口由 provider key 带着首屏拉,滚动+高亮等首屏就绪
+    // 后统一走 _settleOnMessage(高亮不在这里起,否则 3s 计时会在网络
+    // 返回前就跑完,用户看不到落点)
     _anchorMessageId = widget.initialMessageId;
     if (widget.threadId == null) _loadPins();
-    if (_anchorMessageId != null) {
-      _flashHighlight(_anchorMessageId!);
-    }
     _restoreDraft();
   }
 
@@ -327,30 +346,136 @@ class _ChatChannelPageState extends ConsumerState<ChatChannelPage>
     }
   }
 
-  void _jumpToMessage(int messageId) {
-    final state = ref.read(chatMessagesProvider(_streamKey)).value;
-    final inWindow = state?.messages.any((m) => m.id == messageId) ?? false;
-    if (inWindow && state != null) {
-      // AutoScrollTag 的 index 用消息 id(稳定,不随窗口翻页漂移)
-      unawaited(
-        _scrollController.scrollToIndex(
-          messageId,
-          preferPosition: AutoScrollPosition.middle,
-          duration: const Duration(milliseconds: 250),
-        ),
-      );
-      _flashHighlight(messageId);
+  /// 跳到某条消息:窗口内→测几何瞬移;窗口外→原地换锚点窗口再瞬移
+  ///
+  /// 不再整页 pushReplacement(转场闪断,且丢滚动位置/草稿/多选态),
+  /// 与 [_jumpToLatest] 同一口径:路由不动。
+  ///
+  /// 定位不走 scrollToIndex:目标 tag 未挂载时它会用最近 tag 的几何
+  /// 外推、每步一小段 animateTo 逐步逼近,气泡行高可变又没给
+  /// suggestedRowHeight,外推常常一步不动就提前 break —— 表现为"滚一点
+  /// 就停,第二次点才对"(第二次目标已挂载,走的是快路径)。这里改成
+  /// 先确保目标在窗口内,再按真实几何一次 jumpTo。
+  Future<void> _jumpToMessage(int messageId) async {
+    if (_jumpLock) return;
+    _jumpLock = true;
+    try {
+      final state = ref.read(chatMessagesProvider(_streamKey)).value;
+      final inWindowNow =
+          state?.messages.any((m) => m.id == messageId) ?? false;
+      // 只有真要请求才盖转圈:已在窗口内时盖一下再撤是无谓闪烁
+      if (!inWindowNow) setState(() => _jumping = true);
+      try {
+        final inWindow = await _notifier.loadWindowAround(messageId);
+        if (!mounted) return;
+        if (!inWindow) {
+          // 服务端锚点窗口里没有它:多半已被删除
+          ToastService.showError(S.current.error_notFoundOrDeleted);
+          return;
+        }
+      } catch (_) {
+        // 换窗口失败(网络等):旧窗口没动,提示一下即可
+        if (mounted) ToastService.showError(S.current.error_loadFailed);
+        return;
+      } finally {
+        // 撤转圈必须在定位之前:转圈盖着时列表是卸载状态,
+        // AutoScrollTag 不在 tagMap 里,几何永远测不到
+        if (_jumping) {
+          if (mounted) {
+            setState(() => _jumping = false);
+          } else {
+            _jumping = false;
+          }
+        }
+      }
+      await _settleOnMessage(messageId);
+    } finally {
+      _jumpLock = false;
+    }
+  }
+
+  /// 落点收尾:目标行挂载后按真实几何瞬移 + 高亮
+  ///
+  /// 目标可能"在窗口内但还没挂载"(在 ListView 缓存区外,tagMap 里没有),
+  /// 此时测不到几何,等下一帧重试;列表每帧会多铺一点,几帧内必然挂上。
+  /// 参照话题详情页 _finalizeInitialPosition 的 postFrame+retry 模式。
+  Future<void> _settleOnMessage(int messageId, {int retry = 0}) async {
+    await SchedulerBinding.instance.endOfFrame;
+    if (!mounted) return;
+
+    // 列表刚从转圈切回来时要等一帧才有 client,不能当失败退出
+    if (!_scrollController.hasClients) {
+      if (retry >= _settleMaxRetry) return;
+      await _settleOnMessage(messageId, retry: retry + 1);
       return;
     }
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(
-        builder: (_) => ChatChannelPage(
-          channelId: widget.channelId,
-          threadId: widget.threadId,
-          initialMessageId: messageId,
-        ),
+
+    // reverse 列表:getOffsetToReveal 的 alignment 相对滚动前缘(视觉下方),
+    // 要贴视觉顶得传 1
+    final offset = _scrollController.topAlignOffsetForScrollIndex(
+      messageId,
+      alignment: 1.0,
+    );
+    if (offset == null) {
+      if (retry >= _settleMaxRetry) {
+        // 极端情况(行始终没挂上):退回包内爬行定位,尽力而为
+        unawaited(
+          _scrollController.scrollToIndex(
+            messageId,
+            preferPosition: AutoScrollPosition.middle,
+            duration: const Duration(milliseconds: 250),
+          ),
+        );
+        _flashHighlight(messageId);
+        return;
+      }
+      // 逼近目标:先让列表往目标方向铺开,下一帧再测。
+      // 每次重试都推一把 —— 一次推动只铺开一屏,目标远在缓存区外时
+      // 要连推几帧才够得着
+      _nudgeTowards(messageId);
+      await _settleOnMessage(messageId, retry: retry + 1);
+      return;
+    }
+
+    final position = _scrollController.position;
+    // 顶对齐会让目标压在置顶横幅底下(横幅浮在列表之上,不占列表空间),
+    // 落点退掉横幅高度让它整条露出来 —— 不额外留白,消息自己的行间距
+    // 就是视觉呼吸位。
+    // reverse 列表沿 AxisDirection.up 滚动:pixels 增大 = 视口移向更旧的
+    // 消息 = 目标相对视口往下移,所以是 +avoid(方向由 scroll_jump_test
+    // 的"浮层避让方向"用例钉住)
+    final avoid = _pins.isEmpty ? 0.0 : _pinnedBannerHeight;
+    // jumpTo 而非 animateTo:动画期 velocity≠0,期间若列表重新布局导致
+    // maxScrollExtent 收缩,位置会留在边界外并被弹回(详见 scroll_jump.dart)
+    _scrollController.jumpTo(
+      (offset + avoid).clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
       ),
+    );
+    // 高亮计时到落点才起:重载慢于 3s 时提前起会让用户看不到落点
+    _flashHighlight(messageId);
+    // 构造性定位不产生滚动事件,落点可能正处在分页触发区,主动评估一次
+    _onScroll();
+  }
+
+  /// 目标未挂载时朝它的方向推一把,让 ListView 下一帧把它铺出来
+  void _nudgeTowards(int messageId) {
+    if (!_scrollController.hasClients) return;
+    final anchored = _scrollController.tagMap.keys;
+    if (anchored.isEmpty) return;
+    // reverse 列表:消息 id 越小(越旧)越靠 pixels 大的一侧
+    final nearest = messageId < anchored.reduce(math.min)
+        ? anchored.reduce(math.min)
+        : anchored.reduce(math.max);
+    final nearestOffset = _scrollController.topAlignOffsetForScrollIndex(
+      nearest,
+      alignment: 1.0,
+    );
+    if (nearestOffset == null) return;
+    final position = _scrollController.position;
+    _scrollController.jumpTo(
+      nearestOffset.clamp(position.minScrollExtent, position.maxScrollExtent),
     );
   }
 
@@ -910,21 +1035,25 @@ class _ChatChannelPageState extends ConsumerState<ChatChannelPage>
     ref.listen(chatMessagesProvider(_streamKey), (prev, next) {
       final state = next.value;
       if (state == null) return;
-      // 锚点模式首屏就绪:滚到目标消息(仅一次,prev 无数据时)
+      // 锚点模式首屏就绪:滚到目标消息并高亮(仅一次,prev 无数据时)
+      // 与跳转同源,走同一套落点收尾
       final target = _anchorMessageId;
-      if (target != null && prev?.value == null) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted) return;
-          _scrollController.scrollToIndex(
-            target,
-            preferPosition: AutoScrollPosition.middle,
-            duration: const Duration(milliseconds: 250),
-          );
-        });
+      if (target != null && prev?.value == null && !_settledAnchor) {
+        _settledAnchor = true;
+        unawaited(_settleOnMessage(target));
       }
       _scheduleMarkRead();
       if (widget.threadId == null) _syncPinsFromMessages(state.messages);
     });
+
+    // provider 已有数据时上面的 listen 不会 fire(它只在状态变化时回调),
+    // 首屏锚点会永远等不到滚动 —— 这里补一次同样的判定。
+    // _settleOnMessage 首句就 await endOfFrame,不会在 build 期间动状态
+    final anchor = _anchorMessageId;
+    if (anchor != null && !_settledAnchor && messagesAsync.value != null) {
+      _settledAnchor = true;
+      unawaited(_settleOnMessage(anchor));
+    }
 
     return PopScope(
       // 移动端表情面板开着时,返回键先收面板(编辑器同款),不退页
@@ -1010,7 +1139,13 @@ class _ChatChannelPageState extends ConsumerState<ChatChannelPage>
             // 避让位承担(见 _buildMessageList),值取 _composerHeight
             Positioned.fill(
               child: messagesAsync.when(
-                data: (state) => _buildMessageList(theme, state),
+                // 跳转换窗口期间同样整屏转圈(与首屏加载一个观感)。
+                // 由页面自己的 _jumping 驱动、不进 provider 状态:标志位
+                // 放进 state 会被 MessageBus 广播的 copyWith 带着走,
+                // 广播频繁的大频道里极易固化成永久 loading
+                data: (state) => _jumping
+                    ? const Center(child: LoadingSpinner())
+                    : _buildMessageList(theme, state),
                 loading: () => const Center(child: LoadingSpinner()),
                 error: (error, stack) => ErrorView(
                   error: error,
@@ -1026,16 +1161,23 @@ class _ChatChannelPageState extends ConsumerState<ChatChannelPage>
                 top: 0,
                 left: 0,
                 right: 0,
-                child: _PinnedBanner(
-                  pins: _pins,
-                  cursor: _pinCursor % _pins.length,
-                  onTap: () {
-                    final pin = _pins[_pinCursor % _pins.length];
-                    setState(
-                      () => _pinCursor = (_pinCursor + 1) % _pins.length,
-                    );
-                    _jumpToMessage(pin.id);
-                  },
+                // 横幅浮在列表之上(列表铺满整页),跳转落点要扣掉它的
+                // 高度才不会顶死在它下沿 —— 与输入条同一套量法
+                child: HeightReporter(
+                  onHeight: (height) => _pinnedBannerHeight = height,
+                  child: _PinnedBanner(
+                    pins: _pins,
+                    cursor: _pinCursor % _pins.length,
+                    onTap: () async {
+                      final pin = _pins[_pinCursor % _pins.length];
+                      await _jumpToMessage(pin.id);
+                      // 轮换放在跳转之后:跳失败时不该把指示器推到下一条
+                      if (!mounted) return;
+                      setState(
+                        () => _pinCursor = (_pinCursor + 1) % _pins.length,
+                      );
+                    },
+                  ),
                 ),
               ),
             // 回到底部浮钮(离底/锚点模式时出现):钉在输入条上沿

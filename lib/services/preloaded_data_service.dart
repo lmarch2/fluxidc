@@ -522,7 +522,11 @@ class PreloadedDataService {
         AppConstants.baseUrl,
         options: Options(
           headers: {'Accept': 'text/html'},
-          extra: {if (AppConstants.skipCsrfForHomeRequest) 'skipCsrf': true},
+          extra: {
+            if (AppConstants.skipCsrfForHomeRequest) 'skipCsrf': true,
+            // 诊断标注:首页 HTML 是 CF 盾高发路径,日志里需可辨识
+            'requestTag': 'preload-home',
+          },
         ),
       );
 

@@ -71,6 +71,7 @@ import '../poll_builder_dialog.dart';
 import '../template_insert_dialog.dart';
 import '../composer_shortcuts.dart' show composerShortcutHint;
 import '../markdown_toolbar.dart' show MarkdownToolbarState;
+import '../../crypto/crypto_encrypt_sheet.dart';
 import 'callout_edit_dialog.dart';
 import 'block_completion_rules.dart';
 import 'composer_doc_codec.dart';
@@ -1827,6 +1828,9 @@ class RichComposerEditorState extends State<RichComposerEditor> {
         item('__date__', Icons.event_rounded, '日期时间'),
         // 投票:构建对话框生成 [poll] BBCode(经 cook 成岛)
         item('__poll__', Icons.poll_rounded, '投票'),
+        // 加解密工具箱:选区文本加密为 ```enc 块(与 MD 模式工具栏钥匙
+        // 同入口);无选区时面板里输入明文
+        item('__encrypt__', Icons.enhanced_encryption_rounded, '加密内容…'),
         // 音视频:选文件改名 .xz 上传后插 <audio>/<video> 标签
         item('__audio__', Icons.audiotrack_rounded, '上传音频'),
         item('__video__', Icons.videocam_outlined, '上传视频'),
@@ -1845,6 +1849,8 @@ class RichComposerEditorState extends State<RichComposerEditor> {
       await _insertLocalDate();
     } else if (selected == '__poll__') {
       await _insertPoll();
+    } else if (selected == '__encrypt__') {
+      await _insertEncryptedBlock();
     } else if (selected == '__audio__' || selected == '__video__') {
       await _pickAndInsertMedia(isAudio: selected == '__audio__');
     } else if (selected == '__voice__') {
@@ -2870,6 +2876,22 @@ class RichComposerEditorState extends State<RichComposerEditor> {
     final spec = await showCalloutEditDialog(context);
     if (spec == null || !mounted) return;
     await insertMarkdownSnippet('> ${spec.headerMarkdown}\n> 内容');
+  }
+
+  /// 加解密工具箱:选区文本(若有)加密为 ```enc 代码块插入。
+  ///
+  /// pasteBlocks 在选区非空时先删后插 —— 恰好实现「选中内容加密替换」
+  /// 语义;无选区时弹窗中手动输入明文。
+  Future<void> _insertEncryptedBlock() async {
+    final editor = _editor;
+    if (editor == null) return;
+    final selectedMd = editor.copySelectionAsMarkdown();
+    final ciphertext = await showCryptoEncryptSheet(
+      context: context,
+      initialPlaintext: selectedMd.isEmpty ? null : selectedMd,
+    );
+    if (ciphertext == null || !mounted) return;
+    await insertMarkdownSnippet('```enc\n$ciphertext\n```');
   }
 
   /// 插入投票:构建对话框 → [poll] BBCode 经 cook 成岛。同帖多投票时

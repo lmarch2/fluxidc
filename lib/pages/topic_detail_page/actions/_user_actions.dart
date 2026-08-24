@@ -101,6 +101,9 @@ extension _UserActions on _TopicDetailPageState {
 
   /// 等待键盘完全收起后再滚动到指定帖子
   void _scrollAfterKeyboardDismiss(int postNumber) {
+    // 树形视图:新帖已就地插入树中(根回复 prepend/子回复自动展开),
+    // 对齐 Discourse nested 的 skipJumpOnSave,不做跳转
+    if (_isNestedView) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       if (MediaQuery.of(context).viewInsets.bottom > 0) {
@@ -142,8 +145,7 @@ extension _UserActions on _TopicDetailPageState {
                     : () async {
                         setState(() => isDeleting = true);
                         try {
-                          await DiscourseService()
-                              .deleteReviewable(pending.id);
+                          await DiscourseService().deleteReviewable(pending.id);
                           if (dialogContext.mounted) {
                             Navigator.pop(dialogContext, true);
                           }
@@ -554,9 +556,25 @@ extension _UserActions on _TopicDetailPageState {
 
   void _handleSolutionChanged(int postId, bool accepted) {
     final params = _params;
+    Post? sourcePost;
+    if (_isNestedView) {
+      // 树形帖子在独立 provider:同步盖章状态;帖子对象供平铺侧 banner 反查
+      // (目标帖可能不在平铺加载窗口里)
+      sourcePost = _findPostInNestedTree(postId);
+      ref
+          .read(nestedTopicProvider(_activeNestedParams).notifier)
+          .updatePostSolution(postId, accepted);
+    }
+    sourcePost ??= ref
+        .read(topicDetailProvider(params))
+        .value
+        ?.postStream
+        .posts
+        .where((p) => p.id == postId)
+        .firstOrNull;
     ref
         .read(topicDetailProvider(params).notifier)
-        .updatePostSolution(postId, accepted);
+        .updatePostSolution(postId, accepted, sourcePost: sourcePost);
   }
 
   void _handleRefreshPost(int postId) {
@@ -618,7 +636,9 @@ extension _UserActions on _TopicDetailPageState {
         ? detail.highestPostNumber
         : detail.postsCount;
     final container = _providerContainer;
-    container.read(topicTrackingStateProvider.notifier).markTopicUnread(
+    container
+        .read(topicTrackingStateProvider.notifier)
+        .markTopicUnread(
           widget.topicId,
           highestPostNumber: highest,
           categoryId: detail.categoryId,
@@ -1017,7 +1037,9 @@ extension _UserActions on _TopicDetailPageState {
               final postNumber = int.tryParse(controller.text.trim());
               Navigator.pop(context);
               if (postNumber != null && postNumber > 0) {
-                _scrollToPost(postNumber.clamp(1, detail.postsCount));
+                unawaited(
+                  _jumpToPostInTopic(postNumber.clamp(1, detail.postsCount)),
+                );
               }
             },
             child: Text(context.l10n.topic_jump),
@@ -1046,7 +1068,7 @@ extension _UserActions on _TopicDetailPageState {
         (maxReadPostNumber < detail.postsCount ? maxReadPostNumber + 1 : null);
 
     if (targetPostNumber != null) {
-      await _scrollToPost(targetPostNumber);
+      await _jumpToPostInTopic(targetPostNumber);
     }
   }
 
@@ -1197,7 +1219,7 @@ extension _UserActions on _TopicDetailPageState {
             S.current.post_replySent,
             type: ToastType.success,
             actionLabel: S.current.post_replySentAction,
-            onAction: () => _scrollToPost(newPost.postNumber),
+            onAction: () => unawaited(_jumpToPostInTopic(newPost.postNumber)),
           );
         }
       }
@@ -1282,7 +1304,7 @@ extension _UserActions on _TopicDetailPageState {
       FrameJankMonitor.logEvent(
         'MSGBUS',
         '积压批量 ${updates.length} 条(${networkPostIds.length} 帖需刷新),'
-        '坍缩为一次整流刷新',
+            '坍缩为一次整流刷新',
       );
       // 旧积压全部作废:整流刷新拉回的就是最终态
       _deferredPostUpdates.clear();
@@ -1413,9 +1435,40 @@ extension _UserActions on _TopicDetailPageState {
       _resolvedViewportPostNumber,
     );
     if (refreshStream) {
-      notifier.refreshWithPostNumber(anchor);
+      unawaited(_reloadStreamKeepingViewport(notifier, anchor));
     } else {
       notifier.reloadTopicMetadata();
+    }
+  }
+
+  /// 整流刷新(reload_topic refresh_stream / 积压坍缩)落地后按锚点重定位。
+  ///
+  /// 与手动刷新 [_handleRefresh] 对齐：刷新只替换数据而不重定位时，
+  /// center 由陈旧的 initialCenterPostNumber（初次定位楼层，阅读中不
+  /// 更新）计算，大概率错锚到新窗口首/末帖 —— 视口被甩到窗口边缘，
+  /// eyeline 随即上报错误楼层，进度条跳到顶部/底部，跳幅是窗口偏移
+  /// 量而非实际阅读位移。state 落地与 prepareRefresh 的标脏在同一
+  /// 微任务链内，合并为一帧 build，错锚帧不会上屏。
+  Future<void> _reloadStreamKeepingViewport(
+    TopicDetailNotifier notifier,
+    int anchor,
+  ) async {
+    await notifier.refreshWithPostNumber(anchor);
+    if (!mounted) return;
+    final updated = ref.read(topicDetailProvider(_params)).value;
+    if (updated == null) return;
+    // 刷新在途(网络往返)期间用户可能已继续滚动:落地时重取当前位置,
+    // 仍在新窗口内就按新位置重锚,避免把用户拽回刷新前的楼层。
+    final currentAnchor = _controller.getRefreshAnchorPostNumber(
+      _resolvedViewportPostNumber,
+    );
+    final posts = updated.postStream.posts;
+    final effectiveAnchor =
+        posts.any((p) => p.postNumber == currentAnchor) ? currentAnchor : anchor;
+    if (posts.any((p) => p.postNumber == effectiveAnchor)) {
+      _controller.prepareRefresh(effectiveAnchor, skipHighlight: true);
+    } else {
+      _controller.clearJumpTarget();
     }
   }
 

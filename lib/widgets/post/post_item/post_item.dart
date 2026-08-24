@@ -16,8 +16,10 @@ import '../post_boost/boost_actions.dart';
 import '../post_boost/boost_danmaku.dart';
 import '../post_signature_block.dart';
 import '../small_action_item.dart';
+import '../../crypto/crypto_decrypt_sheet.dart';
 import '../../topic/assign_sheet.dart';
 import 'quote_selection_helper.dart';
+import '../../../../services/crypto/crypto_cipher_format.dart';
 import 'render_parse_cache.dart';
 import 'widgets/post_footer_section/post_footer_section.dart';
 import 'widgets/post_header_section.dart';
@@ -348,6 +350,18 @@ class _PostItemState extends ConsumerState<PostItem> {
                             onCopyToast: () => ToastService.showSuccess(
                               context.l10n.common_copiedToClipboard,
                             ),
+                            // 划词「解密」:选中文本命中密文特征时 toolbar 显示,
+                            // 打开加解密工具箱解密面板(ENC1/OpenSSL/编码)。
+                            onDecryptRequest: (plainText) =>
+                                showCryptoDecryptSheet(
+                              context: context,
+                              initialCiphertext: plainText,
+                              onQuoteReply: widget.onQuoteSelection == null
+                                  ? null
+                                  : (plaintext) => widget
+                                      .onQuoteSelection!(plaintext, post),
+                            ),
+                            decryptTextDetector: isDecryptableText,
                           );
                         },
                       ),

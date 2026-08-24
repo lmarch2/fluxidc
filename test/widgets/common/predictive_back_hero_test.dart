@@ -1,11 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:fluxdo/widgets/common/predictive_back_cupertino_transitions.dart';
+import 'package:common_ui/common_ui.dart';
 
-/// Hero 路由 × 预测返回:useSharedElementPreview: false 时路由仍认领
-/// 手势(HeroController 只为 user gesture 转场启动飞行),视觉走
-/// fallback;两端 Hero 均带 transitionOnUserGestures。
+/// Hero 路由 × 预测返回:路由认领手势是 Hero 跟手飞行的前提
+/// (HeroController 只为 user gesture 转场启动带 transitionOnUserGestures
+/// 的飞行,不认领则 Hero 完全不飞);视觉由调用方自己的 transitionBuilder
+/// 决定(方案 A 单一分支)。两端 Hero 均带 transitionOnUserGestures。
 void main() {
   final binding = TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -73,8 +74,7 @@ void main() {
                               animation,
                               secondaryAnimation,
                               child,
-                              useSharedElementPreview: false,
-                              fallbackBuilder: (_, animation, _, child) =>
+                              transitionBuilder: (_, animation, _, child) =>
                                   FadeTransition(
                                     opacity: animation,
                                     child: child,
@@ -114,7 +114,7 @@ void main() {
       });
       await tester.pump();
 
-      // 路由已认领手势(useSharedElementPreview: false 不再放弃认领)
+      // 路由已认领手势(认领是 Hero 跟手飞行的前提)
       expect(navigatorKey.currentState!.userGestureInProgress, isTrue);
 
       await sendGesture('updateBackGestureProgress', {
@@ -126,14 +126,6 @@ void main() {
 
       // 手势期间 Hero 已跟手起飞;视觉走 fallback,不套缩放预览
       expect(heroFlights, greaterThan(0));
-      expect(
-        find.byWidgetPredicate(
-          (widget) =>
-              widget.runtimeType.toString() ==
-              '_PredictiveBackSharedElementPageTransition',
-        ),
-        findsNothing,
-      );
 
       await sendGesture('commitBackGesture');
       await tester.pumpAndSettle();

@@ -14,6 +14,7 @@ import '../../services/app_error_handler.dart';
 import '../../services/discourse_cache_manager.dart';
 import '../../services/preloaded_data_service.dart';
 import '../../services/toast_service.dart';
+import '../../theme/theme_resolver.dart';
 import '../../utils/dialog_utils.dart';
 import '../../utils/number_utils.dart';
 import '../../utils/platform_utils.dart';
@@ -506,7 +507,11 @@ class _UserCardContentState extends ConsumerState<_UserCardContent> {
 
   Future<void> _load() async {
     try {
-      final user = await ref.read(discourseServiceProvider).getUserCard(widget.username);
+      // 带话题上下文时请求该用户在此话题内的发帖数(topic_post_count),
+      // 决定「只看 TA」按钮是否显示
+      final user = await ref
+          .read(discourseServiceProvider)
+          .getUserCard(widget.username, includePostCountFor: widget.topicId);
       if (!mounted) return;
       setState(() {
         _user = user;
@@ -586,6 +591,40 @@ class _UserCardContentState extends ConsumerState<_UserCardContent> {
     }
   }
 
+  /// 该用户在当前话题的发帖数(无话题上下文/响应未带时为 0)
+  int get _topicPostCount {
+    final topicId = widget.topicId;
+    if (topicId == null) return 0;
+    return _user?.topicPostCount[topicId] ?? 0;
+  }
+
+  /// 当前话题是否已在「只看这个用户」过滤中
+  bool get _isFilteringThisUser {
+    final topicId = widget.topicId;
+    if (topicId == null) return false;
+    final params = TopicDetailNotifier.activeParamsFor(topicId);
+    if (params == null) return false;
+    final container = ProviderScope.containerOf(
+      widget.anchorContext,
+      listen: false,
+    );
+    if (!container.exists(topicDetailProvider(params))) return false;
+    return container.read(topicDetailProvider(params).notifier).usernameFilter ==
+        widget.username;
+  }
+
+  /// 只看该用户/取消过滤:发到请求桥,由话题详情页消费(过滤重载 +
+  /// UI 复位都在页面侧,卡片只负责发意图)
+  void _toggleFilterPosts() {
+    final topicId = widget.topicId;
+    if (topicId == null) return;
+    final cancel = _isFilteringThisUser;
+    widget.onClose();
+    ProviderScope.containerOf(widget.anchorContext, listen: false)
+        .read(topicUserFilterRequestProvider.notifier)
+        .request(topicId: topicId, username: cancel ? null : widget.username);
+  }
+
   Future<void> _setNotificationLevel(String level) async {
     final service = ref.read(discourseServiceProvider);
 
@@ -654,7 +693,7 @@ class _UserCardContentState extends ConsumerState<_UserCardContent> {
 
     final card = Container(
       decoration: BoxDecoration(
-        color: surface,
+        color: theme.colorScheme.overlaySurface,
         borderRadius: BorderRadius.circular(20),
         boxShadow: [
           // 桌面端无遮罩，靠更重的投影把卡片从背景中托起来
@@ -1012,59 +1051,90 @@ class _UserCardContentState extends ConsumerState<_UserCardContent> {
     final canFollow = isLoggedIn && user?.canFollow == true;
     final canMute = isLoggedIn && user?.canMuteUser == true;
     final canIgnore = isLoggedIn && user?.canIgnoreUser == true;
+    // 「只看 TA」:话题上下文中该用户发帖 ≥2 才显示(对齐官方
+    // enoughPostsForFiltering 门槛;=1 时过滤只剩主帖+这一帖,无意义)。
+    // 已在过滤中时恒显示,承担取消入口。
+    final isFiltering = _isFilteringThisUser;
+    final canFilter =
+        widget.topicId != null && (_topicPostCount >= 2 || isFiltering);
 
     final primary = <Widget>[];
     if (canChat) {
-      primary.add(Expanded(
-        child: FilledButton.icon(
-          onPressed: _openChat,
-          icon: const Icon(Symbols.chat_rounded, size: 18),
-          label: Text(S.current.userCard_chat),
-        ),
+      primary.add(FilledButton.icon(
+        onPressed: _openChat,
+        icon: const Icon(Symbols.chat_rounded, size: 18),
+        label: Text(S.current.userCard_chat),
       ));
     }
     if (canMessage) {
-      primary.add(Expanded(
-        child: canChat
-            ? FilledButton.tonalIcon(
-                onPressed: _composeMessage,
-                icon: const Icon(Symbols.mail_rounded, size: 18),
-                label: Text(S.current.userProfile_message),
-              )
-            : FilledButton.icon(
-                onPressed: _composeMessage,
-                icon: const Icon(Symbols.mail_rounded, size: 18),
-                label: Text(S.current.userProfile_message),
-              ),
-      ));
+      primary.add(canChat
+          ? FilledButton.tonalIcon(
+              onPressed: _composeMessage,
+              icon: const Icon(Symbols.mail_rounded, size: 18),
+              label: Text(S.current.userProfile_message),
+            )
+          : FilledButton.icon(
+              onPressed: _composeMessage,
+              icon: const Icon(Symbols.mail_rounded, size: 18),
+              label: Text(S.current.userProfile_message),
+            ));
     }
     if (canFollow) {
-      primary.add(Expanded(
-        child: _isFollowed
-            ? OutlinedButton.icon(
-                onPressed: _followLoading ? null : _toggleFollow,
-                icon: const Icon(Symbols.how_to_reg_rounded, size: 18),
-                label: Text(S.current.userProfile_followed),
-              )
-            : FilledButton.tonalIcon(
-                onPressed: _followLoading ? null : _toggleFollow,
-                icon: const Icon(Symbols.person_add_alt_rounded, size: 18),
-                label: Text(S.current.userProfile_follow),
-              ),
+      primary.add(_isFollowed
+          ? OutlinedButton.icon(
+              onPressed: _followLoading ? null : _toggleFollow,
+              icon: const Icon(Symbols.how_to_reg_rounded, size: 18),
+              label: Text(S.current.userProfile_followed),
+            )
+          : FilledButton.tonalIcon(
+              onPressed: _followLoading ? null : _toggleFollow,
+              icon: const Icon(Symbols.person_add_alt_rounded, size: 18),
+              label: Text(S.current.userProfile_follow),
+            ));
+    }
+
+    // 窄卡里三个图标+中文文案的按钮塞一行必挤(实测已关注被压到
+    // 竖排折行),每行最多两个,超出的换行铺满
+    final primaryRows = <Widget>[];
+    for (var i = 0; i < primary.length; i += 2) {
+      final rowButtons = primary.sublist(
+        i,
+        (i + 2).clamp(0, primary.length),
+      );
+      primaryRows.add(Row(
+        children: [
+          for (var j = 0; j < rowButtons.length; j++) ...[
+            if (j > 0) const SizedBox(width: 8),
+            Expanded(child: rowButtons[j]),
+          ],
+        ],
       ));
     }
 
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        if (primary.isNotEmpty) ...[
-          Row(
-            children: [
-              for (var i = 0; i < primary.length; i++) ...[
-                if (i > 0) const SizedBox(width: 8),
-                primary[i],
-              ],
-            ],
+        for (final row in primaryRows) ...[
+          row,
+          const SizedBox(height: 8),
+        ],
+        if (canFilter) ...[
+          OutlinedButton.icon(
+            onPressed: _toggleFilterPosts,
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size.fromHeight(40),
+            ),
+            icon: Icon(
+              isFiltering
+                  ? Symbols.filter_list_off_rounded
+                  : Symbols.filter_list_rounded,
+              size: 18,
+            ),
+            label: Text(
+              isFiltering
+                  ? S.current.userCard_cancelFilterPosts
+                  : S.current.userCard_filterPosts(_topicPostCount),
+            ),
           ),
           const SizedBox(height: 8),
         ],

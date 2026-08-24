@@ -35,15 +35,10 @@ Widget buildPoll({
     // 图表类型来自 cooked 属性(API poll 数据不带 chart_type);
     // number 型没有该属性 → null → bar 现状
     chartType: element.attributes['data-poll-charttype'] as String?,
-    onPollUpdated: (updatedPoll, updatedVotes) {
-      final pollIndex = post.polls?.indexWhere((p) => p.name == pollName) ?? -1;
-      if (pollIndex >= 0 && post.polls != null) {
-        post.polls![pollIndex] = updatedPoll;
-      }
-      if (post.pollsVotes != null) {
-        post.pollsVotes![pollName] = updatedVotes;
-      }
-    },
+    // 落地到 post 实例:widget 滚出 cacheExtent 销毁后重建时从这里现读。
+    // (首次投票时 post.pollsVotes 为 null,applyPollUpdate 内部 ??= 初始化。)
+    onPollUpdated: (updatedPoll, updatedVotes) =>
+        post.applyPollUpdate(pollName, updatedPoll, updatedVotes),
   );
 }
 

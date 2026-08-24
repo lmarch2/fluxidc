@@ -235,6 +235,7 @@ class NewEngineChunkSegment extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final theme = Theme.of(context);
     FrameJankMonitor.noteBuild(
       'chk#${post.postNumber}:$chunkIndex/'
       '${(chunk.html.length / 1000).toStringAsFixed(1)}k',
@@ -242,6 +243,13 @@ class NewEngineChunkSegment extends ConsumerWidget {
     Widget content = FluxdoRender(
           cookedHtml: chunk.html,
           parsedNodes: parsedNodes,
+          // 正文字号注入 contentFontScale(与 PostItem 短帖路径一致):
+          // 不传时 NodeFactory 回退 theme.bodyMedium,长帖 chunk 的字号设置失效。
+          baseTextStyle: theme.textTheme.bodyMedium?.copyWith(
+            height: 1.5,
+            fontSize: (theme.textTheme.bodyMedium?.fontSize ?? 14) *
+                ref.watch(preferencesProvider).contentFontScale,
+          ),
           imageIndexOffset: imageIndexOffset,
           footnotesHtml: footnotesHtml,
           // 同 post 各 chunk 共享一个选区作用域 → 选区可跨 chunk。

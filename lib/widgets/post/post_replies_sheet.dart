@@ -18,6 +18,8 @@ import '../common/app_bottom_sheet.dart';
 import 'package:m3e_ui/m3e_ui.dart';
 import '../../utils/fluxdo_render_callbacks.dart';
 import 'post_item/quote_selection_helper.dart';
+import '../crypto/crypto_decrypt_sheet.dart';
+import '../../services/crypto/crypto_cipher_format.dart';
 import 'post_item/widgets/post_footer_section/post_footer_section.dart';
 import 'post_item/widgets/post_header_section.dart';
 import 'reply_sheet.dart';
@@ -515,6 +517,14 @@ class _PostRepliesSheetContentState
                 onCopyToast: () => ToastService.showSuccess(
                   S.current.common_copiedToClipboard,
                 ),
+                onDecryptRequest: (plainText) => showCryptoDecryptSheet(
+                  context: context,
+                  initialCiphertext: plainText,
+                  onQuoteReply: _isLoggedIn
+                      ? (plaintext) => _handleQuoteSelection(plaintext, post)
+                      : null,
+                ),
+                decryptTextDetector: isDecryptableText,
               ),
         ),
         PostFooterSection(

@@ -9,6 +9,8 @@ import 'package:flutter/material.dart';
 import 'package:app_icons/app_icons.dart';
 import 'package:flutter/services.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+
+import '../../widgets/crypto/crypto_encrypt_sheet.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:super_clipboard/super_clipboard.dart';
@@ -520,6 +522,43 @@ class MarkdownToolbarState extends State<MarkdownToolbar> {
         ),
       );
     }
+
+    widget.focusNode?.requestFocus();
+  }
+
+  /// 打开加解密工具箱加密面板，把选中内容加密为 ```enc 代码块。
+  ///
+  /// 有选中文本时预填明文并在返回后**替换选区**；无选中则插入光标处。
+  Future<void> insertEncryptedBlock() async {
+    final selection = widget.controller.selection;
+    final text = widget.controller.text;
+
+    String? initialText;
+    if (selection.isValid && selection.start != selection.end) {
+      initialText = selection.textInside(text);
+    }
+
+    final ciphertext = await showCryptoEncryptSheet(
+      context: context,
+      initialPlaintext: initialText,
+    );
+
+    if (ciphertext == null) {
+      widget.focusNode?.requestFocus();
+      return;
+    }
+
+    final block = '```enc\n$ciphertext\n```';
+    final insertPos = selection.isValid ? selection.start : text.length;
+    final endPos = selection.isValid && selection.start != selection.end
+        ? selection.end
+        : insertPos;
+
+    final newText = text.replaceRange(insertPos, endPos, block);
+    widget.controller.value = TextEditingValue(
+      text: newText,
+      selection: TextSelection.collapsed(offset: insertPos + block.length),
+    );
 
     widget.focusNode?.requestFocus();
   }

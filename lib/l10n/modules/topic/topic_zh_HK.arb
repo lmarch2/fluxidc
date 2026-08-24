@@ -4,6 +4,14 @@
   "topicDetail_addToReadLaterSuccess": "已加入浮窗",
   "topicDetail_aiAssistant": "AI 助手",
   "topicDetail_authorOnly": "只看題主",
+  "topicDetail_userOnly": "只看 @{username}",
+  "@topicDetail_userOnly": {
+    "placeholders": {
+      "username": {
+        "type": "String"
+      }
+    }
+  },
   "topicDetail_browseMoreInCategory": "想閱讀更多？瀏覽 {category} 分類",
   "@topicDetail_browseMoreInCategory": {
     "placeholders": {
@@ -17,6 +25,9 @@
   "topicDetail_editTopic": "編輯話題",
   "topicDetail_exportArticle": "導出文章",
   "topicDetail_generateShareImage": "生成分享圖片",
+  "topicDetail_toc": "目錄",
+  "topicDetail_tocCollapse": "收起目錄",
+  "topicDetail_tocExpand": "展開目錄",
   "topicDetail_sortByActivity": "按活動排序",
   "topicDetail_hotOnly": "只看熱門",
   "topicDetail_loadFailedTapRetry": "加載失敗，點擊重試",

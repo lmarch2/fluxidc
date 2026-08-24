@@ -156,6 +156,9 @@ class UserProfileSkeleton extends StatelessWidget {
     // 横屏时屏幕高度有限，限制 expandedHeight 不超过屏幕高度的 70%
     final screenHeight = MediaQuery.of(context).size.height;
     final double expandedHeight = 410.0.clamp(0.0, screenHeight * 0.7);
+    // 与正式页面同口径的精简模式(见 UserProfilePage._buildSliverAppBar):
+    // 高度装不下完整头部时骨架同步精简,保证 loading->成品不跳版式。
+    final bool compactHeader = expandedHeight < 340;
 
     return Scaffold(
       body: Skeleton(
@@ -184,7 +187,10 @@ class UserProfileSkeleton extends StatelessWidget {
                   child: _buildTabBarSkeleton(context),
                 ),
               ),
-              flexibleSpace: _buildFlexibleSpaceSkeleton(context),
+              flexibleSpace: _buildFlexibleSpaceSkeleton(
+                context,
+                compact: compactHeader,
+              ),
             ),
             // 内容骨架屏
             SliverPadding(
@@ -223,7 +229,10 @@ class UserProfileSkeleton extends StatelessWidget {
     );
   }
 
-  Widget _buildFlexibleSpaceSkeleton(BuildContext context) {
+  Widget _buildFlexibleSpaceSkeleton(
+    BuildContext context, {
+    bool compact = false,
+  }) {
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -236,7 +245,7 @@ class UserProfileSkeleton extends StatelessWidget {
         Positioned(
           left: 20 + MediaQuery.of(context).padding.left,
           right: 20 + MediaQuery.of(context).padding.right,
-          bottom: 36 + 24, // TabBar 高度 + 间距
+          bottom: 36 + (compact ? 12 : 24), // TabBar 高度 + 间距
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
@@ -287,15 +296,17 @@ class UserProfileSkeleton extends StatelessWidget {
               ),
               // 与真实页面一致：16 + 12 = 28
               const SizedBox(height: 16),
-              const SizedBox(height: 12),
-              // 签名区域 (高度54)
-              Container(
-                height: 54,
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(8),
+              // 签名区域 (高度54,精简模式与正式页面同步隐藏)
+              if (!compact) ...[
+                const SizedBox(height: 12),
+                Container(
+                  height: 54,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
                 ),
-              ),
+              ],
               // 签名后间距
               const SizedBox(height: 16),
               // 统计行1：关注、粉丝（高度17）
@@ -303,9 +314,15 @@ class UserProfileSkeleton extends StatelessWidget {
               const SizedBox(height: 8),
               // 统计行2：获赞、访问、话题、回复（高度17）
               const _SkeletonBoxWhite(width: 200, height: 17),
-              // 活动时间
-              const SizedBox(height: 12),
-              const _SkeletonBoxWhite(width: 80, height: 20, borderRadius: 12),
+              // 活动时间(精简模式与正式页面同步隐藏)
+              if (!compact) ...[
+                const SizedBox(height: 12),
+                const _SkeletonBoxWhite(
+                  width: 80,
+                  height: 20,
+                  borderRadius: 12,
+                ),
+              ],
             ],
           ),
         ),

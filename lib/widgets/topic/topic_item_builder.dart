@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import '../../models/category.dart';
 import '../../models/topic.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../providers/discourse_providers.dart';
+import '../../services/topic_preview_preloader.dart';
 import '../../utils/responsive.dart';
 import 'painted_topic_card.dart';
 import 'topic_card.dart';
@@ -70,64 +73,106 @@ Widget buildTopicItem({
   List<PreviewAction>? previewActions,
   WidgetBuilder? previewCustomActionPanelBuilder,
 }) {
-  Widget child;
+  final isMobile = Responsive.isMobile(context);
 
-  VoidCallback? longPress() => enableLongPress
+  // 一镜到底锚点底色:与各分支卡片外壳底色一致(置顶紧凑卡是半透明
+  // surfaceContainerLow,普通卡是 cardTheme.color;落地高亮瞬时值优先)
+  final theme = Theme.of(context);
+  final anchorColor =
+      highlightColor ??
+      (topic.pinned
+          ? theme.colorScheme.surfaceContainerLow.withValues(alpha: 0.5)
+          : theme.cardTheme.color ?? theme.colorScheme.surfaceContainerLow);
+
+  // Builder 紧贴卡片构造:longPress 需要卡片自身的 context 取屏幕
+  // rect 作一镜到底起点(外层 context 的 RenderObject 在桌面端居中
+  // 约束下是满宽,不是卡身)。bottomGap 裁掉卡片外壳底部间距。
+  VoidCallback? longPressFor(BuildContext cardContext) => enableLongPress
       ? () => TopicPreviewDialog.show(
           context,
           topic: topic,
           onOpen: onTap,
           actions: previewActions,
           customActionPanelBuilder: previewCustomActionPanelBuilder,
+          anchorRect: topicCardAnchorRect(
+            cardContext,
+            bottomGap: topic.pinned ? 6 : 8,
+          ),
+          anchorColor: anchorColor,
         )
       : null;
 
-  final isMobile = Responsive.isMobile(context);
+  // 长按意图预加载(正文):移动端按住不动 250ms / 桌面右键按下即触发,
+  // 弹窗打开时正文多已在路上。chat 类场景没有话题 id 的不适用(调用
+  // 方会自带 firstPostLoader,不受预加载影响)
+  final previewIntent = enableLongPress
+      ? () => TopicPreviewPreloader.preload(
+          ProviderScope.containerOf(
+            context,
+            listen: false,
+          ).read(discourseServiceProvider),
+          topic.id,
+        )
+      : null;
 
-  if (topic.pinned) {
-    child = CompactTopicCard(
-      topic: topic,
-      onTap: onTap,
-      onMiddleClick: onMiddleClick,
-      onLongPress: longPress(),
-      isSelected: isSelected,
-      highlightColor: highlightColor,
-      categoryMap: categoryMap,
-    );
-  } else if (kUsePaintedTopicCard && topWidget == null && middleWidget == null) {
-    // 自绘路径:排版全局缓存 + 单渲染对象。宽度口径见
-    // [topicCardWidthFor];分类表由调用方传入(未传时不查,分类行缺分
-    // 类名 —— 各列表页均已传)
-    final layout = obtainTopicItemLayout(
-      context: context,
-      topic: topic,
-      categoryMap: categoryMap,
-      statsAvailableWidth: statsAvailableWidth,
-      messageStyle: messageStyle,
-    );
-    child = PaintedTopicCard(
-      layout: layout,
-      onTap: onTap,
-      onMiddleClick: onMiddleClick,
-      onLongPress: longPress(),
-      isSelected: isSelected,
-      highlightColor: highlightColor,
-    );
-  } else {
-    child = TopicCard(
-      topic: topic,
-      onTap: onTap,
-      onMiddleClick: onMiddleClick,
-      onLongPress: longPress(),
-      isSelected: isSelected,
-      highlightColor: highlightColor,
-      topWidget: topWidget,
-      middleWidget: middleWidget,
-      messageStyle: messageStyle,
-      categoryMap: categoryMap,
-      statsAvailableWidth: statsAvailableWidth,
-    );
-  }
+  // 自绘路径的排版在 Builder 外先取好:入参(context/theme/宽度)与
+  // Builder 内一致,避免逐分支重复。
+  final usePainted =
+      kUsePaintedTopicCard && topWidget == null && middleWidget == null;
+  final paintedLayout = usePainted && !topic.pinned
+      ? obtainTopicItemLayout(
+          context: context,
+          topic: topic,
+          categoryMap: categoryMap,
+          statsAvailableWidth: statsAvailableWidth,
+          messageStyle: messageStyle,
+        )
+      : null;
+
+  // 自绘路径:排版全局缓存 + 单渲染对象。宽度口径见
+  // [topicCardWidthFor];分类表由调用方传入(未传时不查,分类行缺分
+  // 类名 —— 各列表页均已传)
+  final Widget child = Builder(
+    builder: (cardContext) {
+      if (topic.pinned) {
+        return CompactTopicCard(
+          topic: topic,
+          onTap: onTap,
+          onMiddleClick: onMiddleClick,
+          onLongPress: longPressFor(cardContext),
+          onPreviewIntent: previewIntent,
+          isSelected: isSelected,
+          highlightColor: highlightColor,
+          categoryMap: categoryMap,
+        );
+      }
+      if (paintedLayout != null) {
+        return PaintedTopicCard(
+          layout: paintedLayout,
+          onTap: onTap,
+          onMiddleClick: onMiddleClick,
+          onLongPress: longPressFor(cardContext),
+          onPreviewIntent: previewIntent,
+          isSelected: isSelected,
+          highlightColor: highlightColor,
+        );
+      }
+      return TopicCard(
+        topic: topic,
+        onTap: onTap,
+        onMiddleClick: onMiddleClick,
+        onLongPress: longPressFor(cardContext),
+        onPreviewIntent: previewIntent,
+        isSelected: isSelected,
+        highlightColor: highlightColor,
+        topWidget: topWidget,
+        middleWidget: middleWidget,
+        messageStyle: messageStyle,
+        categoryMap: categoryMap,
+        statsAvailableWidth: statsAvailableWidth,
+      );
+    },
+  );
 
   if (!isMobile) {
     return Center(

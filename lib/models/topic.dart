@@ -747,7 +747,10 @@ class Post {
   final List<PostReaction>? reactions; // 回应/表情
   final PostReaction? currentUserReaction; // 当前用户的回应
   final List<Poll>? polls; // 投票列表
-  final Map<String, List<String>>? pollsVotes; // 用户投票记录 {pollName: [optionId]}
+  // 用户投票记录 {pollName: [optionId]}。非 final:投票落地(applyPollUpdate)
+  // 需要原地写 —— 服务端只在用户已有投票记录时才下发 polls_votes,首次投票
+  // 时该字段为 null,若不可写,投票结果无处落地,widget 重建后即丢投票状态。
+  Map<String, List<String>>? pollsVotes;
 
   // post-voting(问答)话题字段(仅问答话题下发)
   final int postVotingVoteCount; // 帖子总票数(up-down,可为负)
@@ -1375,6 +1378,27 @@ class Post {
 
   /// 今天是否是用户生日(birthdate 年份可能是隐私假值,只比月/日)
   bool get isTodayBirthday => _isTodayMonthDay(userBirthdate);
+
+  /// 投票/撤票成功后把最新 poll 与我的选择落地到本实例(原地更新)。
+  ///
+  /// 投票交互在渲染层 _PollWidget 内完成,不走 provider:widget 自己 setState,
+  /// 重建(滚出 cacheExtent 再滚回、重进话题)时从 post 现读 —— 所以必须在这里
+  /// 落地,否则 State 销毁后投票状态丢失。
+  ///
+  /// - [updatedPoll] 覆盖 [polls] 中同名 poll(票数/状态);
+  /// - [votes] 拷贝写入 [pollsVotes](防调用方后续 mutate 同一 List 污染 post);
+  ///   服务端只在用户已有投票记录时才下发 polls_votes,首次投票时该字段为 null,
+  ///   这里 ??= 初始化,修复「首投后滚出滚回丢投票状态」。
+  ///
+  /// copyWith 浅拷贝会带着这两个引用走,provider 后续换实例不丢已落地数据。
+  void applyPollUpdate(String pollName, Poll updatedPoll, List<String> votes) {
+    final list = polls;
+    if (list != null) {
+      final index = list.indexWhere((p) => p.name == pollName);
+      if (index >= 0) list[index] = updatedPoll;
+    }
+    (pollsVotes ??= {})[pollName] = List.from(votes);
+  }
 }
 
 /// Policy 用户摘要（精简字段：id / username / avatar_template）

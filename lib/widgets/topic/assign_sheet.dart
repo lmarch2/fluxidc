@@ -10,6 +10,7 @@ import '../../models/topic.dart';
 import '../../providers/core_providers.dart';
 import '../../providers/topic_detail_provider.dart';
 import '../../services/toast_service.dart';
+import '../../utils/dialog_utils.dart';
 import '../common/smart_avatar.dart';
 import '../markdown_editor/markdown_editor.dart';
 import '../../services/preloaded_data_service.dart';
@@ -49,7 +50,7 @@ Future<void> showAssignSheet(
   WidgetRef ref, {
   required int topicId,
 }) async {
-  await showModalBottomSheet<void>(
+  await showAppBottomSheet<void>(
     context: context,
     isScrollControlled: true,
     builder: (ctx) => _AssignSheet(topicId: topicId),

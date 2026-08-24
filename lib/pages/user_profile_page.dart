@@ -57,8 +57,18 @@ import 'chat/channel/chat_channel_page.dart';
 import 'package:common_ui/common_ui.dart';
 import '../l10n/s.dart';
 import '../utils/dialog_utils.dart';
+import '../widgets/common/hero_image.dart';
 
 /// 用户个人页
+/// 头像的展示方式:方形账号是 cover 裁切 + 圆角,圆形账号走 circular。
+///
+/// 一处给出,同时约束源端与 openViewer 两侧参数(见 ViewerSourceStyle)——
+/// 此前两处不同步:源端 borderRadius 12 而 openViewer 传 heroSourceRadius 8。
+ViewerSourceStyle _avatarStyle({required bool isSquare, required double radius}) =>
+    isSquare
+        ? ViewerSourceStyle.cover(radius: radius)
+        : const ViewerSourceStyle.circular();
+
 class UserProfilePage extends ConsumerStatefulWidget {
   final String username;
 
@@ -1723,18 +1733,22 @@ class _UserProfilePageState extends ConsumerState<UserProfilePage>
       onTap: () {
         if (_user?.getAvatarUrl() != null) {
           final fullUrl = _user!.getAvatarUrl(size: 360);
-          // 与页面头像同参(144)的缩略图作飞行纹理,命中已解码缓存;
-          // 圆形头像飞行中圆↔直角连续插值(方形化账号走圆角 8 插值)
+          // 与页面头像同参(144)的缩略图作飞行纹理,命中已解码缓存
           final thumbUrl = _user!.getAvatarUrl(size: 144);
-          final sq = isSquareAvatarUrl(thumbUrl);
+          // 与源端同源:同一个 _avatarStyle(isSquare, radius: 12)。
+          // 此前这里写死 radius 8 而源端 borderRadius 12,两处不同步。
+          final args = _avatarStyle(
+            isSquare: isSquareAvatarUrl(thumbUrl),
+            radius: 12,
+          ).openViewerArgs;
           ImageViewerPage.open(
             context,
             fullUrl,
             heroTag: 'user_avatar_${_user!.username}',
             thumbnailUrl: thumbUrl,
-            heroSourceCircular: !sq,
-            heroSourceRadius: sq ? 8 : 0,
-            heroSourceFit: sq ? BoxFit.cover : null,
+            heroSourceFit: args.fit,
+            heroSourceRadius: args.radius,
+            heroSourceCircular: args.circular,
           );
         }
       },
@@ -1752,9 +1766,14 @@ class _UserProfilePageState extends ConsumerState<UserProfilePage>
           flairName: _user?.flairName,
           flairBgColor: _user?.flairBgColor,
           flairColor: _user?.flairColor,
-          avatar: Hero(
-            tag: 'user_avatar_${_user?.username ?? ''}',
-            transitionOnUserGestures: true,
+          // HeroImage 统一件:飞行起点、源端隐藏/占位、圆角(或圆形)插值
+          // 都由它保证;style 同时约束 openViewer 侧参数
+          avatar: HeroImage(
+            heroTag: 'user_avatar_${_user?.username ?? ''}',
+            style: _avatarStyle(isSquare: isSquare, radius: 12),
+            flightImage: avatarUrl == null
+                ? null
+                : discourseImageProvider(avatarUrl),
             child: SmartAvatar(
               imageUrl: avatarUrl,
               radius: radius,
@@ -1960,7 +1979,10 @@ class _UserProfilePageState extends ConsumerState<UserProfilePage>
     // 横屏时屏幕高度有限，限制 expandedHeight 不超过屏幕高度的 70%
     final screenHeight = MediaQuery.of(context).size.height;
     final double expandedHeight = 410.0.clamp(0.0, screenHeight * 0.7);
-
+    // 头部完整内容(头像行+简介卡+双行统计+活跃胶囊)加底部间距约需 340px;
+    // 横屏被上面限高后装不下,开精简模式(隐简介卡/活跃胶囊)——否则自底
+    // 锚定的内容向上溢出,与 toolbar 返回键/操作按钮及状态栏叠印。
+    final bool compactHeader = expandedHeight < 340;
     // 检查是否是自己
     final isOwnProfile =
         currentUser != null &&
@@ -2067,10 +2089,15 @@ class _UserProfilePageState extends ConsumerState<UserProfilePage>
               Positioned(
                 left: 20,
                 right: 20,
-                bottom: 36 + 24, // TabBar 高度 + 间距
+                // TabBar 高度 + 间距(精简模式收紧间距,给内容让位)
+                bottom: 36 + (compactHeader ? 12 : 24),
                 child: Opacity(
                   opacity: contentOpacity,
-                  child: _buildUserInfoContent(theme, currentUser),
+                  child: _buildUserInfoContent(
+                    theme,
+                    currentUser,
+                    compact: compactHeader,
+                  ),
                 ),
               ),
 
@@ -2143,10 +2170,18 @@ class _UserProfilePageState extends ConsumerState<UserProfilePage>
   }
 
 
-  /// 用户信息列(头像/名字/简介/统计/最近活动)。窄版放在 SliverAppBar
-  /// flexibleSpace 层2(白字压深色头图);宽版放在左侧资料栏——同一份
-  /// 构建,两种容器,背景都是「渐变+头图+压暗遮罩」所以文字样式通用。
-  Widget _buildUserInfoContent(ThemeData theme, User? currentUser) {
+  /// 用户信息列(头像/名字/简介/统计/最近活动),窄版 SliverAppBar
+  /// flexibleSpace 层2 专用(白字压深色头图);宽版左栏是同风格的另一
+  /// 套排版(见 _buildWideInfoPanel),两边各自维护。
+  ///
+  /// [compact] 精简模式(横屏等 flexibleSpace 高度受限时):隐藏简介卡/
+  /// 封禁条与最近活跃胶囊,只留头像行+统计,防止内容向上溢出叠到
+  /// toolbar/状态栏。
+  Widget _buildUserInfoContent(
+    ThemeData theme,
+    User? currentUser, {
+    bool compact = false,
+  }) {
     final hasBio = _user?.bio != null && _user!.bio!.isNotEmpty;
     final hasLocation = _user?.location != null && _user!.location!.isNotEmpty;
     final hasWebsite = _user?.website != null && _user!.website!.isNotEmpty;
@@ -2171,19 +2206,21 @@ class _UserProfilePageState extends ConsumerState<UserProfilePage>
                   final avatarUrl = _user!.getAvatarUrl(
                     size: 360,
                   );
-                  // 与页面头像同参(144)的缩略图作飞行纹理,
-                  // 命中已解码缓存;圆形头像飞行中圆↔直角
-                  // 连续插值(方形化账号走圆角 8 插值)
+                  // 与页面头像同参(144)的缩略图作飞行纹理,命中已解码缓存
                   final thumbUrl = _user!.getAvatarUrl(size: 144);
-                  final isSquare = isSquareAvatarUrl(thumbUrl);
+                  // 与源端同源(同竖版口径,见 _avatarStyle)
+                  final args = _avatarStyle(
+                    isSquare: isSquareAvatarUrl(thumbUrl),
+                    radius: 12,
+                  ).openViewerArgs;
                   ImageViewerPage.open(
                     context,
                     avatarUrl,
                     heroTag: 'user_avatar_${_user!.username}',
                     thumbnailUrl: thumbUrl,
-                    heroSourceCircular: !isSquare,
-                    heroSourceRadius: isSquare ? 8 : 0,
-                    heroSourceFit: isSquare ? BoxFit.cover : null,
+                    heroSourceFit: args.fit,
+                    heroSourceRadius: args.radius,
+                    heroSourceCircular: args.circular,
                   );
                 }
               },
@@ -2215,11 +2252,13 @@ class _UserProfilePageState extends ConsumerState<UserProfilePage>
                       flairName: _user?.flairName,
                       flairBgColor: _user?.flairBgColor,
                       flairColor: _user?.flairColor,
-                      avatar: Hero(
-                        tag: 'user_avatar_${_user?.username ?? ''}',
-                        // 预测返回是 user gesture 转场,
-                        // 不开此标记头像不飞(查看器侧已开)
-                        transitionOnUserGestures: true,
+                      // HeroImage 统一件(同竖版口径)
+                      avatar: HeroImage(
+                        heroTag: 'user_avatar_${_user?.username ?? ''}',
+                        style: _avatarStyle(isSquare: isSquare, radius: 12),
+                        flightImage: avatarUrl == null
+                            ? null
+                            : discourseImageProvider(avatarUrl),
                         child: SmartAvatar(
                           imageUrl: avatarUrl,
                           radius: 36,
@@ -2332,8 +2371,9 @@ class _UserProfilePageState extends ConsumerState<UserProfilePage>
           ],
         ),
         const SizedBox(height: 16),
-        // 封禁/禁言状态 与 个人简介 互斥显示（与 Discourse 前端一致）
-        if (_user!.isSuspended || _user!.isSilenced) ...[
+        // 封禁/禁言状态 与 个人简介 互斥显示（与 Discourse 前端一致）。
+        // 精简模式整块隐藏——简介与封禁详情仍可从「关于」弹窗查看。
+        if (!compact && (_user!.isSuspended || _user!.isSilenced)) ...[
           GestureDetector(
             onTap: _showUserInfo,
             child: Column(
@@ -2379,7 +2419,7 @@ class _UserProfilePageState extends ConsumerState<UserProfilePage>
               ],
             ),
           ),
-        ] else ...[
+        ] else if (!compact) ...[
           // 个人简介（非封禁/禁言状态时显示）
           const SizedBox(height: 12),
           GestureDetector(
@@ -2523,9 +2563,9 @@ class _UserProfilePageState extends ConsumerState<UserProfilePage>
             ],
           ),
 
-        // 最近活动时间
-        if (_user?.lastPostedAt != null ||
-            _user?.lastSeenAt != null) ...[
+        // 最近活动时间(精简模式隐藏)
+        if (!compact &&
+            (_user?.lastPostedAt != null || _user?.lastSeenAt != null)) ...[
           const SizedBox(height: 12),
           Container(
             padding: const EdgeInsets.symmetric(
