@@ -1,5 +1,33 @@
 # 发版与 iOS IPA
 
+## FluxDO 同步版发布
+
+FluxIDC 跟进 FluxDO 稳定版时，统一使用 GitHub Actions 作为编译和打包验证，不以本地 Flutter 环境为发布前提。
+
+1. 将稳定版 `upstream/main` 合入 `main`，保留 IDC Flare 站点配置、FluxIDC 品牌、平台包名、深链和独立更新源。
+2. 更新 `pubspec.yaml`、`README.md` 和 `UPSTREAM.md`，提交并推送 `main`。
+3. 按 `v<上游版本>-fluxidc.<修订号>` 创建指向合并提交的草稿 Release。
+4. 从该提交分别运行 `Build Android APK` 和 `Build iOS IPA`，并将标签传入 `release_tag`。
+5. 等待两个 Action 成功，确认 APK、IPA 及同名 `sha256` 文件已挂载后再发布 Release。
+
+```bash
+gh release create "vX.Y.Z-fluxidc.N" \
+  --repo lmarch2/fluxidc \
+  --target "<merge-commit>" \
+  --title "FluxIDC vX.Y.Z" \
+  --draft
+
+gh workflow run build-android.yaml \
+  --repo lmarch2/fluxidc \
+  --ref main \
+  -f release_tag="vX.Y.Z-fluxidc.N"
+
+gh workflow run build-ios.yaml \
+  --repo lmarch2/fluxidc \
+  --ref main \
+  -f release_tag="vX.Y.Z-fluxidc.N"
+```
+
 ## 版本亮点(stable 发版前)
 
 stable 版本的发布日志正文取自 `highlights/v<版本>.md`(用户视角亮点),GitHub Release 会把全量
