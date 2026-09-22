@@ -22,7 +22,7 @@
   <a href="UPSTREAM.md">上游说明</a>
 </p>
 
-FluxIDC 基于 [FluxDO](https://github.com/Lingyan000/fluxdo) v0.2.27 适配，保留其 Flutter、Discourse、WebView 登录和 Cookie 同步能力，并将站点、品牌、深链及平台包名切换到 IDC Flare。
+FluxIDC 基于 [FluxDO](https://github.com/Lingyan000/fluxdo) v0.2.28 适配，保留其 Flutter、Discourse、WebView 登录和 Cookie 同步能力，并将站点、品牌、深链及平台包名切换到 IDC Flare。
 
 > [!IMPORTANT]
 > 本项目是社区维护的非官方客户端，与 IDC Flare 官方及 FluxDO 上游作者均无隶属关系。使用前请自行判断风险并妥善保管账号数据。IDC Flare 名称与图形标志归其权利人所有。
@@ -42,7 +42,7 @@ Android 安装包按 ABI 分开构建：
 下载对应 APK 后，可直接在系统文件管理器中打开安装，或使用 ADB：
 
 ```bash
-adb install -r FluxIDC-0.2.27-arm64-v8a.apk
+adb install -r FluxIDC-0.2.28-arm64-v8a.apk
 ```
 
 未配置 Android 签名 secrets 时，CI 和本地 release 构建会回退到调试签名。不同签名的 APK 不能直接覆盖安装；遇到签名冲突时，应先备份应用数据，再卸载旧版本。

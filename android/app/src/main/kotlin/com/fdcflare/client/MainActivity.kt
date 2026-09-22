@@ -93,6 +93,12 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
     }
 
+    // SAF「另存为」建档结果先给 PublicFileChannel 认领,不是它的再交给插件
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (PublicFileChannel.handleActivityResult(requestCode, resultCode, data)) return
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
         FairMemoryReceiver.detachEngine(flutterEngine)
         super.cleanUpFlutterEngine(flutterEngine)
@@ -104,6 +110,8 @@ class MainActivity : FlutterActivity() {
         FairMemoryReceiver.attachEngine(flutterEngine)
         // 媒体转码通道(音视频压缩到 4MB:media3 Transformer 硬编)
         MediaTranscodeChannel.register(this, flutterEngine.dartExecutor.binaryMessenger)
+        // 公共文件落盘通道(MediaStore 下载目录 / SAF 另存为 / 打开 content uri)
+        PublicFileChannel.register(this, flutterEngine.dartExecutor.binaryMessenger)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "openInBrowser" -> {
@@ -155,6 +163,15 @@ class MainActivity : FlutterActivity() {
                 "setCrashlyticsEnabled" -> {
                     val enable = call.argument<Boolean>("enabled") ?: false
                     FluxdoApplication.setCrashlytics(enable)
+                    result.success(null)
+                }
+                // 崩溃/ANR 现场的页面上下文:线上事件的 customKeys 一直是空的,
+                // ANR 主线程栈又全是 framework 帧,没有这个就不知道用户当时在哪。
+                "setCrashContext" -> {
+                    FluxdoApplication.setCrashContext(
+                        call.argument<String>("route"),
+                        call.argument<String>("routeTrail"),
+                    )
                     result.success(null)
                 }
                 else -> result.notImplemented()

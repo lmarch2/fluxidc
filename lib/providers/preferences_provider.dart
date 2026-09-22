@@ -5,10 +5,12 @@ import 'package:flutter/services.dart';
 // ignore: depend_on_referenced_packages
 import 'package:flutter_riverpod/legacy.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../constants.dart';
 import '../models/topic_card_style.dart';
 import '../navigation/nav_action_bus.dart';
 import '../services/network/request_scheduler_config.dart';
 import '../services/cf_challenge_service.dart';
+import '../services/crash_context_reporter.dart';
 import '../utils/blocked_user_filter.dart';
 import '../widgets/topic/topic_card_layout.dart';
 import 'theme_provider.dart';
@@ -114,6 +116,13 @@ class AppPreferences {
 
   /// 本地内容屏蔽用户名列表。只影响本客户端的展示，不会同步到 Discourse。
   final List<String> blockedUsernames;
+
+  /// 是否在话题列表顶部显示「已隐藏 N 条话题」提示条。
+  ///
+  /// 只管提示条本身：关掉后关键词过滤与本地屏蔽名单照常生效，只是不再
+  /// 留下一行痕迹——给「过滤了就别再提醒我」的用户用。管理入口仍在
+  /// 设置 → 内容过滤，不会因此不可达。
+  final bool showFilterHint;
 
   /// 话题关键词过滤的归一化形式（lowercase），匹配时使用
   late final List<String> normalizedFilterKeywords = List.unmodifiable(
@@ -286,6 +295,7 @@ class AppPreferences {
     required this.topicFilterKeywords,
     this.topicFilterWholeWord = false,
     this.blockedUsernames = const [],
+    this.showFilterHint = true,
     required this.crashlytics,
     required this.portraitLock,
     required this.fullscreenSwipeBack,
@@ -347,6 +357,7 @@ class AppPreferences {
     List<String>? topicFilterKeywords,
     bool? topicFilterWholeWord,
     List<String>? blockedUsernames,
+    bool? showFilterHint,
     bool? crashlytics,
     bool? portraitLock,
     bool? fullscreenSwipeBack,
@@ -409,6 +420,7 @@ class AppPreferences {
       topicFilterKeywords: topicFilterKeywords ?? this.topicFilterKeywords,
       topicFilterWholeWord: topicFilterWholeWord ?? this.topicFilterWholeWord,
       blockedUsernames: blockedUsernames ?? this.blockedUsernames,
+      showFilterHint: showFilterHint ?? this.showFilterHint,
       crashlytics: crashlytics ?? this.crashlytics,
       portraitLock: portraitLock ?? this.portraitLock,
       fullscreenSwipeBack: fullscreenSwipeBack ?? this.fullscreenSwipeBack,
@@ -497,6 +509,7 @@ class PreferencesNotifier extends StateNotifier<AppPreferences> {
   static const String _topicFilterKeywordsKey = 'pref_topic_filter_keywords';
   static const String _topicFilterWholeWordKey = 'pref_topic_filter_whole_word';
   static const String _blockedUsernamesKey = 'pref_blocked_usernames';
+  static const String _showFilterHintKey = 'pref_show_filter_hint';
   static const String _crashlyticsKey = 'pref_crashlytics';
   static const String _portraitLockKey = 'pref_portrait_lock';
   static const String _fullscreenSwipeBackKey = 'pref_fullscreen_swipe_back';
@@ -582,6 +595,7 @@ class PreferencesNotifier extends StateNotifier<AppPreferences> {
               _prefs.getBool(_topicFilterWholeWordKey) ?? false,
           blockedUsernames:
               _prefs.getStringList(_blockedUsernamesKey) ?? const [],
+          showFilterHint: _prefs.getBool(_showFilterHintKey) ?? true,
           crashlytics: _prefs.getBool(_crashlyticsKey) ?? true,
           portraitLock: _prefs.getBool(_portraitLockKey) ?? false,
           fullscreenSwipeBack:
@@ -759,7 +773,14 @@ class PreferencesNotifier extends StateNotifier<AppPreferences> {
     await _prefs.setStringList(_blockedUsernamesKey, sanitized);
   }
 
+  Future<void> setShowFilterHint(bool enabled) async {
+    if (state.showFilterHint == enabled) return;
+    state = state.copyWith(showFilterHint: enabled);
+    await _prefs.setBool(_showFilterHintKey, enabled);
+  }
+
   Future<void> setCrashlytics(bool enabled) async {
+    enabled = AppConstants.enableCrashReporting && enabled;
     state = state.copyWith(crashlytics: enabled);
     await _prefs.setBool(_crashlyticsKey, enabled);
     if (Platform.isAndroid) {
@@ -767,6 +788,8 @@ class PreferencesNotifier extends StateNotifier<AppPreferences> {
         'enabled': enabled,
       });
     }
+    // 关闭采集时导航上下文同步停掉
+    CrashContextReporter.setEnabled(Platform.isAndroid && enabled);
   }
 
   Future<void> setPortraitLock(bool enabled) async {

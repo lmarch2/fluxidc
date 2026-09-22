@@ -67,6 +67,7 @@ List<SettingsGroup> buildPreferencesGroups(BuildContext context) {
           title: l10n.preferences_topicFilterKeywords,
           subtitle: l10n.preferences_topicFilterKeywordsDesc,
           icon: Symbols.filter_alt_off_rounded,
+          wrapSubtitle: true,
           getDynamicSubtitle: (ref) {
             final count = ref
                 .watch(preferencesProvider)
@@ -82,15 +83,27 @@ List<SettingsGroup> buildPreferencesGroups(BuildContext context) {
           title: l10n.preferences_blockedUsernames,
           subtitle: l10n.preferences_blockedUsernamesDesc,
           icon: Symbols.person_off_rounded,
+          wrapSubtitle: true,
           getDynamicSubtitle: (ref) {
             final count = ref
                 .watch(preferencesProvider)
                 .blockedUsernames
                 .length;
-            if (count == 0) return l10n.preferences_blockedUsernamesEmpty;
+            // 空态回落到静态说明(见 subtitle):「未拉黑任何用户」等于没说,
+            // 而空态恰恰是最该解释这功能干什么的时刻。与上面的关键词过滤同体例。
+            if (count == 0) return null;
             return l10n.preferences_blockedUsernamesCount(count);
           },
           onTap: (context, ref) => showBlockedUsernamesDialog(context, ref),
+        ),
+        SwitchModel(
+          id: 'showFilterHint',
+          title: l10n.preferences_showFilterHint,
+          subtitle: l10n.preferences_showFilterHintDesc,
+          icon: Symbols.visibility_rounded,
+          getValue: (ref) => ref.watch(preferencesProvider).showFilterHint,
+          onChanged: (ref, v) =>
+              ref.read(preferencesProvider.notifier).setShowFilterHint(v),
         ),
       ],
     ),
@@ -179,9 +192,8 @@ List<SettingsGroup> buildPreferencesGroups(BuildContext context) {
           subtitle: l10n.preferences_composerLiveRenderDesc,
           icon: Symbols.preview_rounded,
           getValue: (ref) => ref.watch(preferencesProvider).composerLiveRender,
-          onChanged: (ref, v) => ref
-              .read(preferencesProvider.notifier)
-              .setComposerLiveRender(v),
+          onChanged: (ref, v) =>
+              ref.read(preferencesProvider.notifier).setComposerLiveRender(v),
           // 即时渲染(ir)是富文本编辑器的模式,源码编辑器无显形概念
           enabledWhen: (ref) => ref.watch(preferencesProvider).useRichComposer,
         ),
@@ -869,7 +881,11 @@ void _showStickerBaseUrlDialog(BuildContext context, WidgetRef ref) {
             final url = controller.text.trim();
             if (url.isNotEmpty) {
               await service.setBaseUrl(url);
-              ref.invalidate(stickerGroupsProvider);
+              // 换了站点，市场分页/分类/详情全部作废（setBaseUrl 已清网络缓存）。
+              // 订阅列表与其元信息是用户数据，不跟着清。
+              ref.invalidate(marketGroupsProvider);
+              ref.invalidate(marketTopicsProvider);
+              ref.invalidate(stickerGroupDetailProvider);
             }
             if (dialogContext.mounted) Navigator.pop(dialogContext);
           },

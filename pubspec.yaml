@@ -1,7 +1,7 @@
 name: fluxdo
 description: "IDC Flare 非官方跨平台客户端，基于 FluxDO。"
 publish_to: 'none'
-version: 0.2.27+2026082401
+version: 0.2.28+2026092201
 
 environment:
   sdk: ^3.10.4

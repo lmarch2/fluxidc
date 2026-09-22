@@ -88,6 +88,11 @@ android {
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName(releaseBuildSigningName)
+            // FluxIDC 未配置独立的崩溃上报项目，禁用构建期符号上传。
+            configure<com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsExtension> {
+                nativeSymbolUploadEnabled = false
+                mappingFileUploadEnabled = false
+            }
         }
 
         debug {
