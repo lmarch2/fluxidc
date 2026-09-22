@@ -153,6 +153,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}
+          draft: true
           files: |
             dist/${{ steps.package.outputs.apk_name }}
             dist/${{ steps.package.outputs.apk_name }}.sha256
